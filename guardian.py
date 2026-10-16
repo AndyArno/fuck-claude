@@ -630,7 +630,8 @@ class Guardian:
             if not answers:
                 return
             blocked = list(self.config.blocked_cidrs_v4) + list(self.config.blocked_cidrs_v6)
-            report = self._detect_drift(answers, [], blocked)
+            # None = 本轮不做 RIPE diff（曾传 [] 导致空集 diff 全量误报"已不公告"）
+            report = self._detect_drift(answers, None, blocked)
             self._handle_drift_report("DoH", report)
         except Exception as exc:
             self.log.warning("DoH 漂移检查异常（不影响门禁）：%s", exc)

@@ -39,12 +39,13 @@ def _cidr_set(cidrs: list[str]) -> set[str]:
     return out
 
 
-def detect_drift(dns_answers: list[str], ripe_prefixes: list[str],
+def detect_drift(dns_answers: list[str], ripe_prefixes: list[str] | None,
                  blocked_cidrs: list[str]) -> DriftReport:
     """Compare DoH answers and RIPE announced prefixes against configured cidrs.
 
     dns_answers: IPs resolved via DoH for the claude domains.
-    ripe_prefixes: prefixes currently announced by the ASN.
+    ripe_prefixes: prefixes currently announced by the ASN;
+        None = 本轮不做 RIPE diff（DoH 检查用），[] = 明确空集（仍会 diff）。
     blocked_cidrs: configured blocked cidrs (v4 or v6, caller decides).
     """
     doh_outside = tuple(ip for ip in dns_answers if not _covers(blocked_cidrs, ip))
@@ -53,18 +54,22 @@ def detect_drift(dns_answers: list[str], ripe_prefixes: list[str],
     # i.e. the configured set no longer describes reality.
     doh_new = doh_outside
 
-    ripe_set = {_norm(p) for p in ripe_prefixes if _norm(p)}
-    config_set = _cidr_set(blocked_cidrs)
-    ripe_new = tuple(sorted(ripe_set - config_set))
-    ripe_missing = tuple(sorted(config_set - ripe_set))
-
     details: list[str] = []
     if doh_outside:
         details.append("DoH 解析结果不在封禁段内: " + ", ".join(doh_outside))
-    if ripe_new:
-        details.append("RIPE 新公告前缀: " + ", ".join(ripe_new))
-    if ripe_missing:
-        details.append("RIPE 已不公告的配置段: " + ", ".join(ripe_missing))
+
+    if ripe_prefixes is not None:
+        ripe_set = {_norm(p) for p in ripe_prefixes if _norm(p)}
+        config_set = _cidr_set(blocked_cidrs)
+        ripe_new = tuple(sorted(ripe_set - config_set))
+        ripe_missing = tuple(sorted(config_set - ripe_set))
+        if ripe_new:
+            details.append("RIPE 新公告前缀: " + ", ".join(ripe_new))
+        if ripe_missing:
+            details.append("RIPE 已不公告的配置段: " + ", ".join(ripe_missing))
+    else:
+        ripe_new = ()
+        ripe_missing = ()
 
     drift = bool(doh_outside or ripe_new or ripe_missing)
     return DriftReport(
