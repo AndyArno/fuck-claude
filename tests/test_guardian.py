@@ -312,7 +312,7 @@ class TestScheduling:
         for _ in range(10):
             g.tick()
         assert np.local_calls == 10          # 快路径每轮必查
-        assert np.echo_calls == 2            # slow_every=5 → 第 5、10 轮
+        assert np.echo_calls == 3            # 第 1 轮即慢路径 + slow_every=5 → 第 1、5、10 轮
 
     def test_slow_every_matches_config(self, tmp_path):
         g, *_ , _ = make_guardian(tmp_path)
@@ -657,9 +657,13 @@ class TestSelfHeal:
 
         fw.get_status = slow_get_status
         start_heal_thread(g)
-        # heal 线程进入慢 get_status 的窗口内跑 tick
+        # heal 线程进入慢 get_status 的窗口内跑 tick。
+        # 被测 tick 须为纯快路径（第 2 轮）：第 1 轮现在即慢路径
+        # （含 fw 调用、按设计与 heal 互斥），慢路径 tick 与 heal 的
+        # 锁竞争不属本回归的保护对象。
         import time as _t
         _t.sleep(0.05)
+        g._tick_count = 1
         t0 = _t.monotonic()
         g.tick()
         elapsed = _t.monotonic() - t0

@@ -290,8 +290,11 @@ class Guardian:
                 "mihomo进程": False, "TUN网卡": False,
                 "fake-ip": None, "echo出口": None,
             }
-        elif self._tick_count % self._slow_every == 0:
-            # ⑥ 慢路径：echo 出口 IP 三分法 + fake-ip 生效
+        elif self._tick_count == 1 or self._tick_count % self._slow_every == 0:
+            # ⑥ 慢路径：echo 出口 IP 三分法 + fake-ip 生效。
+            # 第 1 轮即跑（不等第 5 轮）：启动→首检省 4 个 fast tick，
+            # 配合确认窗口 3 轮慢路径，启动放行最快 ~15s→~11s，且托盘
+            # 从第一秒就有真实检查数据（此前前 4 秒全是空白误报窗口）。
             event = self._slow_path(local)
 
         # ⑦ 转移 + 副作用
@@ -919,12 +922,19 @@ class Guardian:
             evt = StateEvent(
                 state=state_map[self._gstate.state],
                 exit_ip=self._last_echo_ip or "未知",
-                whitelist_hit=bool(self._last_echo_ip),
+                # 白名单命中 = 上次慢路径的真实判定；从未探测过（None）
+                # 显示未命中。曾误用 bool(_last_echo_ip)：只要探到过出口
+                # IP 就显示"是"，出口变脏时也错报"命中"（用户实测发现）。
+                whitelist_hit=self._last_echo_in_whitelist is True,
                 dns_leak_ip=self._last_dns_ip,
                 checks=dict(self._last_checks),
                 paused=self.paused,
                 drift=self._gstate.drift_alarm,
                 override_active=self._gstate.on_override,
+                # 启动确认期：仍在拦截但检查已全部通过（等待连续确认放行）
+                confirming=(self._gstate.state == sm.BLOCKED
+                            and bool(self._last_checks)
+                            and all(v for v in self._last_checks.values())),
             )
             self.tray.push_event(evt)
         except Exception as exc:

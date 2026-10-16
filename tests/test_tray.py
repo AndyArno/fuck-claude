@@ -49,3 +49,41 @@ class TestDetailLines:
         assert title == "Claude Guard 状态详情"
         assert text == "\n".join(_event().detail_lines())
         assert t.commands.get_nowait() is Command.SHOW_DETAILS
+
+
+class TestStartupConfirming:
+    """启动确认期文案回归：检查全过但仍在拦截时，不得显示"环境正常"。"""
+
+    def _confirming_event(self) -> StateEvent:
+        return StateEvent(
+            state=State.BLOCKED,
+            exit_ip="203.0.113.10",
+            whitelist_hit=True,
+            checks={
+                "mihomo进程": True,
+                "TUN网卡": True,
+                "fake-ip": True,
+                "echo出口": True,
+                "DNS出口干净": True,
+            },
+            confirming=True,
+        )
+
+    def test_confirming_reason_not_normal(self):
+        """确认期：原因行显示确认中，而不是矛盾的"代理环境正常"。"""
+        joined = "\n".join(self._confirming_event().detail_lines())
+        assert "代理环境正常" not in joined
+        assert "确认" in joined
+
+    def test_confirming_status_line(self):
+        lines = self._confirming_event().detail_lines()
+        assert "启动确认中" in lines[0]
+
+    def test_not_confirming_keeps_normal_text(self):
+        """非确认期（稳定拦截）不误加确认文案：无 confirming 字段时行为不变。"""
+        evt = self._confirming_event()
+        evt2 = StateEvent(
+            state=evt.state, exit_ip=evt.exit_ip,
+            whitelist_hit=evt.whitelist_hit, checks=evt.checks,
+        )
+        assert "启动确认中" not in "\n".join(evt2.detail_lines())

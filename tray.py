@@ -63,6 +63,8 @@ class StateEvent:
     paused: bool = False
     drift: bool = False
     override_active: bool = False
+    # 启动确认期：拦截中但检查已全过（等待连续确认），文案显示"确认中"
+    confirming: bool = False
 
     def _status(self) -> Status:
         c = self.checks
@@ -71,6 +73,7 @@ class StateEvent:
             blocking=self.state is State.BLOCKED,
             paused=self.paused,
             override_min_left=(-1 if self.override_active else None),
+            confirming=self.confirming,
             proxy_ok=c.get("mihomo进程"),
             tunnel_ok=c.get("TUN网卡"),
             dns_ok=c.get("fake-ip"),

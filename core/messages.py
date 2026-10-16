@@ -34,6 +34,7 @@ class Status:
     blocking: bool = True            # 防火墙是否处于拦截
     paused: bool = False
     override_min_left: int | None = None  # 临时放行剩余分钟
+    confirming: bool = False         # 启动确认期：检查通过、等待连续确认
     proxy_ok: bool | None = None     # Clash 代理在运行
     tunnel_ok: bool | None = None    # TUN 已接管流量
     dns_ok: bool | None = None       # DNS 没有泄漏（fake-ip 生效）
@@ -58,6 +59,8 @@ def status_line(s: Status) -> str:
         # 拦截原因有两种：环境有风险（出口脏/DNS 泄漏/Clash 异常）→ 风险真实
         # 存在，阻断只是挡住使用；未开 Clash → 风险尚未发生。文案不能断言
         # "无泄漏风险"（曾有 DNS 泄漏态显示该字样自相矛盾，用户实测发现）。
+        if s.confirming:
+            return "🛡 防火墙正在拦截（启动确认中，确认通过后自动放行）"
         return "🛡 防火墙正在拦截 Claude（已阻断风险连接）"
     return "✅ 防火墙已放行 Claude（出口 IP 干净）"
 
@@ -76,6 +79,8 @@ def reason_text(s: Status) -> str:
         return "暂时无法确认出口 IP（探测失败，稍后重试）"
     if s.in_whitelist is False:
         return f"出口 IP 不干净（当前出口 {s.exit_ip or '未知'}，不在你的白名单里）"
+    if s.confirming:
+        return "检查已通过，正在确认环境稳定（约半分钟内自动放行）"
     return "代理环境正常，出口 IP 在白名单内"
 
 
