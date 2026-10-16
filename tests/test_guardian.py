@@ -51,6 +51,17 @@ class FakeFirewall:
         self.calls.append("disable")
         self.global_enabled = False
 
+    def set_blocking(self, config, blocking: bool) -> None:
+        """批量切换（命令路径）：转发为组合标记 + 等价单项调用，
+        既有断言（enable/disable 语义）保持兼容。"""
+        self.calls.append("set_blocking_on" if blocking else "set_blocking_off")
+        if blocking:
+            self.enable(config)
+            self.enable_fakeip(config)
+        else:
+            self.disable(config)
+            self.disable_fakeip(config)
+
     def get_status(self, config):
         self.calls.append("get_status")
         if self.missing:

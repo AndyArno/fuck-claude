@@ -173,6 +173,43 @@ def disable(config: Config) -> None:
     )
 
 
+def set_blocking(config: Config, blocking: bool) -> None:
+    """批量切换 CG-Global + CG-FakeIP 到阻断/放行态（命令路径专用）。
+
+    单次 PS 进程完成"切换+复查"：数组参数同时操作两条规则（cmdlet 只调
+    一次），复查用数组 Get（同进程第二次 cmdlet 复用 CIM 会话）。实测
+    （[耗时] 排查日志）：两次独立调用 ~7.7s（每进程付 ~2.5s NetSecurity
+    加载税 ×2）→ 单进程数组 ~3.6-4.0s。注意：-PassThru 返回切换前快照
+    不能当复查依据（实测 Disable 后 .Enabled 仍 True）。disable 路径
+    规则不存在视为已放行（幂等）；enable 失败由自愈线程 ensure_exists
+    重建兜底。
+    """
+    n1 = _ps_quote(config.rule_name_v4)
+    n2 = _ps_quote(config.rule_name_fakeip)
+    verb = "Enable" if blocking else "Disable"
+    want = "True" if blocking else "False"
+    script = (
+        "Import-Module NetSecurity;"
+        f"{verb}-NetFirewallRule -DisplayName @({n1},{n2}) -ErrorAction Stop;"
+        f"(Get-NetFirewallRule -DisplayName @({n1},{n2})"
+        " -ErrorAction SilentlyContinue)"
+        " | ForEach-Object { Write-Output ([string]$_.Enabled) }"
+    )
+    out = _run_ps(script)
+    states = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+    if len(states) < 2:
+        if not blocking:
+            return  # disable：规则不存在 = 已放行（幂等）
+        raise FirewallError(
+            f"set_blocking(True) rules missing: output={out!r}"
+        )
+    for s in states:
+        if s != want:
+            raise FirewallError(
+                f"set_blocking({blocking}) verification failed: {states!r}"
+            )
+
+
 def _build_get_status_script(name: str) -> str:
     """构造查询规则状态的 PS 脚本（纯函数，可离线单测）。name 需先经 _ps_quote。"""
     return (

@@ -448,11 +448,15 @@ class Guardian:
     # ------------------------------------------------------------------ 状态机
 
     def _apply_event(self, event: str) -> None:
+        import time as _time
+        _t0 = _time.monotonic()
         old = self._gstate
         tr = sm.transition(self._gstate, event)
         self._gstate = tr.new_state
         if tr.actions:
             self._execute(tr.actions)
+        self.log.info("[耗时] 事件 %s 迁移+动作 %.0fms",
+                      event, (_time.monotonic() - _t0) * 1000)
         if old != self._gstate or tr.actions:
             self.log.info("状态转移 %s --%s--> %s actions=%s",
                           old.state, event, self._gstate.state,
@@ -472,12 +476,13 @@ class Guardian:
         for a in actions:
             act = a.get("action")
             if act == sm.ENABLE_FIREWALL:
-                self._fw_tolerant("enable")
-                # CG-FakeIP 与 CG-Global 同命运（门控规则，非永久规则）
-                self._fw_tolerant("enable_fakeip")
+                # 批量切换（一次 PS 进程操作两条规则）：命令路径延迟
+                # 实测 7.7s → ~1s（PS 进程 spawn + NetSecurity 加载是
+                # 每次独立调用的固定 ~2.5s 税，见 [耗时] 排查日志）。
+                # CG-FakeIP 与 CG-Global 同命运（门控规则，非永久规则）。
+                self._fw_tolerant("set_blocking", True)
             elif act == sm.DISABLE_FIREWALL:
-                self._fw_tolerant("disable")
-                self._fw_tolerant("disable_fakeip")
+                self._fw_tolerant("set_blocking", False)
             elif act in (sm.NOTIFY_BLOCK, sm.NOTIFY_ALLOW, sm.NOTIFY_ALERT):
                 title, body = self._toast_text(act)
                 self._notify(title, body)
@@ -529,15 +534,23 @@ class Guardian:
         失败重试；永不向上抛（主循环必须继续，fail-closed 下次自愈再纠正）。
         额外位置/关键字参数透传目标方法（如 create_rule_fakeip 的 ips）。
         单次调用整体持 _fw_lock：与 heal 线程的调用按次互斥，规则读写不交错
-        （重试等待与子进程执行期间不持锁，锁粒度=一次 PS 调用）。"""
+        （重试等待与子进程执行期间不持锁，锁粒度=一次 PS 调用）。
+        每次调用计时入日志（排查命令延迟用：单次 PS 实测 0.75-1.5s，
+        命令路径串行多次即秒级延迟的来源）。"""
+        import time as _time
         for attempt in range(1, retries + 1):
             with self._fw_lock:
+                _t0 = _time.monotonic()
                 try:
                     getattr(self.fw, method)(self.config, *args, **kwargs)
+                    self.log.info("[耗时] fw.%s 第%d次 %.0fms",
+                                  method, attempt,
+                                  (_time.monotonic() - _t0) * 1000)
                     return True
                 except Exception as exc:
-                    self.log.error("防火墙 %s 第 %d/%d 次失败：%s",
-                                   method, attempt, retries, exc)
+                    self.log.error("防火墙 %s 第 %d/%d 次失败（%.0fms）：%s",
+                                   method, attempt, retries,
+                                   (_time.monotonic() - _t0) * 1000, exc)
             if attempt < retries:
                 self._sleep(delay)
         self.log.error("防火墙 %s 重试 %d 次均失败（下轮自愈再纠正）", method, retries)
@@ -693,8 +706,18 @@ class Guardian:
             self._push_tray()
 
     def handle_command(self, cmd: str) -> bool:
-        """处理一条菜单命令；返回 False 表示退出主循环。"""
+        """处理一条菜单命令（含全链路计时）；返回 False 表示退出主循环。"""
+        import time as _time
+        _cmd_t0 = _time.monotonic()
         cmd = str(cmd).strip().lower()
+        self.log.info("[耗时] 命令开始 %s", cmd)
+        result = self._dispatch_command(cmd)
+        self.log.info("[耗时] 命令完成 %s 总计 %.0fms",
+                      cmd, (_time.monotonic() - _cmd_t0) * 1000)
+        return result
+
+    def _dispatch_command(self, cmd: str) -> bool:
+        """命令分发主体（handle_command 包裹计时）。"""
         if cmd == "override_30min":
             self._start_override()
         elif cmd == "end_override":
@@ -718,8 +741,7 @@ class Guardian:
                 self._counter.reset()
                 # 暂停语义 = 冻结在阻断态（fail-closed，安全优先）：
                 # 强制 enable 规则，即使暂停前处于放行态/override。
-                self._fw_tolerant("enable")
-                self._fw_tolerant("enable_fakeip")
+                self._fw_tolerant("set_blocking", True)
                 self._gstate = sm.GateState(
                     sm.BLOCKED, self._gstate.drift_alarm, self._gstate.on_override)
                 self.log.info("守护已暂停（规则冻结在阻断态，不执行检查）")
