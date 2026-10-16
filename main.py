@@ -27,7 +27,7 @@ def _frozen_check() -> int:
 
     from core.config import ConfigError, load as load_config
     from guardian import selfcheck
-    from platform.assets import icon_file
+    from winplat.assets import icon_file
 
     exe_dir = Path(sys.executable).resolve().parent
     config_path = exe_dir / "config.json"

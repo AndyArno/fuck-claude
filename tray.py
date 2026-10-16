@@ -17,8 +17,8 @@ from dataclasses import dataclass, field
 import pystray
 from PIL import Image
 
-from platform.assets import icon_file
-from platform.notify import notify_details, notify_state
+from winplat.assets import icon_file
+from winplat.notify import notify_details, notify_state
 from core.messages import (
     DRIFT_HINT,
     Status,

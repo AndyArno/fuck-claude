@@ -2,7 +2,7 @@
 
 import pytest
 
-from platform.netprobe import check_tun_adapter, parse_ip_sb, parse_trace_ip
+from winplat.netprobe import check_tun_adapter, parse_ip_sb, parse_trace_ip
 
 
 class TestParseTraceIp:
@@ -67,7 +67,7 @@ class TestCheckTunAdapterOffline:
     @pytest.fixture
     def patch_addrs(self, monkeypatch):
         def _patch(mapping):
-            monkeypatch.setattr("platform.netprobe.psutil.net_if_addrs", lambda: mapping)
+            monkeypatch.setattr("winplat.netprobe.psutil.net_if_addrs", lambda: mapping)
 
         return _patch
 

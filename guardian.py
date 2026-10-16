@@ -36,7 +36,7 @@ from core import statemachine as sm
 from core.config import Config, ConfigError, load as load_config
 
 # platform 层默认实现（测试时整体注入替身）
-from platform import dnscheck, firewall as fw_mod, netprobe, ripecheck
+from winplat import dnscheck, firewall as fw_mod, netprobe, ripecheck
 
 _LOGGER_NAME = "claude-guard"
 
@@ -75,7 +75,7 @@ def _guard_namer(default_name: str) -> str:
 
 
 def _default_notify(title: str, body: str) -> None:
-    from platform.notify import notify_state
+    from winplat.notify import notify_state
 
     notify_state(title, body)
 
