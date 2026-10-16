@@ -111,7 +111,7 @@ class StateEvent:
         if self.dns_leak_ip:
             lines.append(f"DNS 解析出口: {self.dns_leak_ip}")
         for name, result in self.checks.items():
-            shown = {True: "通过", False: "失败"}.get(result, "未探测")
+            shown = {True: "通过", False: "未通过"}.get(result, "未探测")
             lines.append(f"{name}: {shown}")
         return lines
 

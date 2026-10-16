@@ -84,11 +84,24 @@ def reason_line(s: Status) -> str:
 
 
 def tooltip(s: Status) -> str:
-    """托盘 tooltip：第一行防火墙状态，第二行原因（拦截态）或出口 IP（放行态）。"""
+    """托盘 tooltip。Windows 托盘 title 硬截断约 127 字符，超长会被砍——
+    优先保证前两行（状态+原因/出口），第三行尽量塞精简检查摘要，
+    塞不下时靠右键"状态详情"看完整版。"""
     line1 = status_line(s)
     if not s.paused and (s.blocking or s.override_min_left is not None):
-        return f"{line1}\n{reason_line(s)}"
-    return f"{line1}\n出口 IP：{s.exit_ip or '未知'}"
+        head = f"{line1}\n{reason_line(s)}"
+    else:
+        head = f"{line1}\n出口 IP：{s.exit_ip or '未知'}"
+    # 精简检查行（用 Status 中性字段）："代理✓ TUN✓ 解析✓ 出口✓ DNS✗"
+    # —— 只在 127 字符截断预算内附加，塞不下就不加（完整版看右键"状态详情"）
+    pairs = [("代理", s.proxy_ok), ("TUN", s.tunnel_ok),
+             ("解析", s.dns_ok), ("出口", s.probe_ok),
+             ("DNS", s.dns_ok if s.dns_leak_ip is None else None)]
+    parts = [f"{label}{'✓' if v else '✗'}" for label, v in pairs]
+    summary = " ".join(parts)
+    if len(head) + len(summary) + 1 <= 120:
+        return f"{head}\n{summary}"
+    return head
 
 
 # ---- Toast 通知 -------------------------------------------------------

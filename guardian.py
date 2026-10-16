@@ -1009,5 +1009,7 @@ def selfcheck(config: Config, logger: logging.Logger | None = None) -> int:
           + (f" records={dns_probe.records}" if dns_probe.records else "")
           + (f" error={dns_probe.error}" if dns_probe.error else ""))
     print(f"\n快路径判定: {'正常' if fast_ok else '失败（将立即阻断）'}")
-    print(f"五项检查: {results}")
+    readable = {k: {True: "通过", False: "未通过"}.get(v, "未探测")
+                for k, v in results.items()}
+    print(f"五项检查: {readable}")
     return 0 if fast_ok else 1
