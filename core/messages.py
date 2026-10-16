@@ -130,8 +130,17 @@ def toast_override_start(minutes: int) -> tuple[str, str]:
 
 
 def toast_override_end() -> tuple[str, str]:
-    """临时放行到期、恢复阻断的 Toast。"""
     return TOAST_TITLE, "🛡 临时放行已结束，防火墙恢复拦截 Claude"
+
+
+def toast_paused() -> tuple[str, str]:
+    """守护暂停的 Toast。"""
+    return TOAST_TITLE, "⏸ 守护已暂停：防火墙保持拦截，不再自动检查环境"
+
+
+def toast_resumed() -> tuple[str, str]:
+    """守护恢复的 Toast。"""
+    return TOAST_TITLE, "▶ 守护已恢复：重新开始检查环境"
 
 
 def toast_drift() -> tuple[str, str]:

@@ -368,6 +368,41 @@ class TestOverride:
         first_until = g.override_until
         assert g.handle_command("override_30min") is True
         assert g.override_until == first_until
+    def test_end_override_restores_block_immediately(self, tmp_path):
+        """手动'立即恢复阻断'：与自然到期同效——enable 规则 + 审计 end。"""
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        g.handle_command("override_30min")
+        assert g._gstate.on_override is True
+        assert fw.global_enabled is False        # 放行中
+        assert g.handle_command("end_override") is True
+        assert g._gstate.on_override is False
+        assert g.override_until is None
+        assert fw.global_enabled is True         # 立即恢复阻断
+        audit = tmp_path / "logs" / "override-audit.log"
+        assert "end manual" in audit.read_text(encoding="utf-8")
+
+    def test_end_override_noop_when_not_overriding(self, tmp_path):
+        """未在临时放行时点'立即恢复阻断'：无副作用（幂等）。"""
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        assert g.handle_command("end_override") is True
+        assert g._gstate.on_override is False
+        assert "enable" not in fw.calls           # 不触发多余规则动作
+
+    def test_toggle_pause_flips_state(self, tmp_path):
+        """合并后的暂停/恢复单项：同一命令来回切换。"""
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        assert g.handle_command("toggle_pause") is True
+        assert g.paused is True
+        assert fw.global_enabled is True          # 暂停冻结在阻断
+        assert g.handle_command("toggle_pause") is True
+        assert g.paused is False
+
+    def test_tray_command_wakes_main_loop_sleep(self, tmp_path):
+        """托盘命令 → _cmd_wake set：主循环可中断睡眠立即结束。"""
+        g, *_ , _ = make_guardian(tmp_path)
+        assert g._cmd_wake.wait(0.05) is False    # 未唤醒时超时返回 False
+        g._cmd_wake.set()
+        assert g._cmd_wake.wait(0.05) is True     # 已 set → 立即返回 True
 
 
 # ----------------------------------------------------------------- 命令

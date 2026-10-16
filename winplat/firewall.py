@@ -161,7 +161,12 @@ def enable(config: Config) -> None:
 
 
 def disable(config: Config) -> None:
-    """停用 CG-Global（放行态）。仅门禁逻辑允许调用。"""
+    """停用 CG-Global（放行态）。仅门禁逻辑允许调用。
+
+    幂等：规则不存在（MISSING）视为已放行，直接成功——规则不在 = 无
+    阻断可停，重试毫无意义（曾 3 次重试 + 1.5s 睡眠白拖 4s）。"""
+    if get_status(config) == STATUS_MISSING:
+        return
     _run_ps(
         "Disable-NetFirewallRule -DisplayName "
         + _ps_quote(config.rule_name_v4)
@@ -284,7 +289,11 @@ def enable_fakeip(config: Config) -> None:
 
 
 def disable_fakeip(config: Config) -> None:
-    """停用 CG-FakeIP（放行态）。仅门禁逻辑允许调用。"""
+    """停用 CG-FakeIP（放行态）。仅门禁逻辑允许调用。
+
+    幂等：规则不存在视为已放行（与 disable 同理）。"""
+    if get_status_fakeip(config) == STATUS_MISSING:
+        return
     _run_ps(
         "Disable-NetFirewallRule -DisplayName "
         + _ps_quote(config.rule_name_fakeip)

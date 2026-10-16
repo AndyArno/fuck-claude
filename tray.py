@@ -38,12 +38,13 @@ class State(enum.Enum):
 class Command(enum.Enum):
     SHOW_DETAILS = "show_details"
     OVERRIDE_30MIN = "override_30min"
-    PAUSE = "pause"
+    END_OVERRIDE = "end_override"   # 立即结束临时放行，恢复阻断
+    TOGGLE_PAUSE = "toggle_pause"   # 暂停/恢复切换（菜单合并为单项）
+    PAUSE = "pause"                 # 兼容旧命令值（热键/脚本）
     RESUME = "resume"
     EDIT_WHITELIST = "edit_whitelist"
     EXIT = "exit"  # T-6：退出前恢复阻断（Enabled）
     QUIT = "quit"  # 仅调试：保持当前规则状态退出
-
 
 @dataclass
 class StateEvent:
@@ -133,6 +134,9 @@ class Tray:
         # None = 当前没有打开的详情窗
         self._detail_box: "LiveMessageBox | None" = None
         self._detail_lock = threading.Lock()
+        # guardian 注册的唤醒回调：托盘投递命令时立即调用（Event.set），
+        # 主循环从 _sleep 中被唤醒，命令毫秒级处理（不等下轮 fast tick）
+        self._on_command: "callable[[], None] | None" = None
 
     # ---- guardian 侧接口 -------------------------------------------------
 
@@ -180,6 +184,12 @@ class Tray:
             if self._icon.icon is not img:
                 self._icon.icon = img
             self._icon.title = evt.tooltip()
+            # 状态变化 → 重建菜单（暂停✔/临时放行项的 visible/enabled
+            # 依赖 _last_event；不重建会显示过期状态）
+            try:
+                self._icon.update_menu()
+            except Exception:
+                pass  # 菜单更新失败不影响守护
         self._last_event = evt
         # 详情窗开着期间实时刷新（状态变化/新检查结果立即反映）
         with self._detail_lock:
@@ -191,19 +201,42 @@ class Tray:
     def _menu_cb(self, cmd: Command):
         def callback(icon, item):
             self.commands.put(cmd)  # 只投递，不执行业务
+            # 立即唤醒 guardian 主循环：命令毫秒级被处理，不等下轮 tick
+            if self._on_command is not None:
+                self._on_command()
 
         return callback
 
+    def _paused(self) -> bool:
+        return bool(self._last_event and self._last_event.paused)
+
+    def _on_override(self) -> bool:
+        return bool(self._last_event and self._last_event.override_active)
+
     def _build_menu(self) -> pystray.Menu:
+        """动态菜单：visible/checked 接 callable，pystray 打开菜单时求值；
+        状态变化时 _apply 里 update_menu() 重建，保证与守护状态一致。"""
         return pystray.Menu(
             pystray.MenuItem(
                 "状态详情", self._show_details, default=True
             ),
             pystray.MenuItem(
-                "临时放行 30 分钟", self._menu_cb(Command.OVERRIDE_30MIN)
+                "临时放行 30 分钟",
+                self._menu_cb(Command.OVERRIDE_30MIN),
+                # 已在临时放行中 → 置灰防重复点击
+                enabled=lambda item: not self._on_override(),
             ),
-            pystray.MenuItem("暂停守护", self._menu_cb(Command.PAUSE)),
-            pystray.MenuItem("恢复守护", self._menu_cb(Command.RESUME)),
+            pystray.MenuItem(
+                "立即恢复阻断",
+                self._menu_cb(Command.END_OVERRIDE),
+                # 仅临时放行中出现（平时隐藏，语义清晰）
+                visible=lambda item: self._on_override(),
+            ),
+            pystray.MenuItem(
+                "暂停守护（✔=已暂停，点击切换）",
+                self._menu_cb(Command.TOGGLE_PAUSE),
+                checked=lambda item: self._paused(),
+            ),
             pystray.MenuItem("编辑白名单", self._menu_cb(Command.EDIT_WHITELIST)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("退出（恢复阻断）", self._menu_cb(Command.EXIT)),

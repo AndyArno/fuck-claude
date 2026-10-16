@@ -176,11 +176,13 @@ class Guardian:
         self._last_checks: dict[str, str] = {}
         self._config_mtime: float | None = self._stat_mtime()
         self._stop = threading.Event()
-        self.exited = threading.Event()      # 主循环结束标志（入口感知退出）
-        self._thread: threading.Thread | None = None
-        # 漂移线程 → 主循环事件队列（也用于内部停止标记）
+        # 托盘命令唤醒：托盘投递命令时 set，主循环 _sleep 立即打断
+        # （命令毫秒级处理，不等下轮 fast tick——override 延迟实测 ~7s→~2s）
+        self._cmd_wake = threading.Event()
         self._incoming: queue.Queue = queue.Queue()
         self._drift_thread: threading.Thread | None = None
+        self.exited = threading.Event()      # 主循环结束标志（入口感知退出）
+        self._thread: threading.Thread | None = None
         # 审计日志（override）
         self._audit_path = Path(config.log_dir or "logs") / "override-audit.log"
 
@@ -189,6 +191,9 @@ class Guardian:
     def start(self) -> None:
         """启动漂移/自愈线程 + 主循环线程；先预热防火墙子进程。"""
         self._preheat()
+        # 托盘命令 → 立即唤醒主循环（可中断睡眠）
+        if self.tray is not None and hasattr(self.tray, "_on_command"):
+            self.tray._on_command = self._cmd_wake.set
         self._drift_thread = threading.Thread(
             target=self._drift_loop, name="drift-monitor", daemon=True
         )
@@ -229,7 +234,10 @@ class Guardian:
                     break
             except Exception:
                 self.log.exception("tick 异常（继续运行，fail-closed）")
-            self._sleep(self.config.fast_tick_sec)
+            # 可中断睡眠：托盘命令到达（_cmd_wake.set）立即醒，否则睡满
+            # fast_tick。命令延迟从 0~1s 降到毫秒级。
+            self._cmd_wake.wait(self.config.fast_tick_sec)
+            self._cmd_wake.clear()
         self.log.info("Guardian 主循环退出")
         self.exited.set()  # 通知入口：主循环已结束（不依赖 is_alive 轮询）
         # 托盘"退出"由 handle_command 完成 enable 后走到这里；被外部 stop()
@@ -479,6 +487,10 @@ class Guardian:
     def _toast_text(self, act: str) -> tuple[str, str]:
         """状态切换 Toast 文案，统一从 core.messages 取（用户可见面）。"""
         if act == sm.NOTIFY_ALLOW:
+            # 临时放行开始的放行动作 ≠ 出口干净：override 语境用专属文案
+            # （曾误报"出口 IP 干净"误导用户，实测发现）。
+            if self._gstate.on_override:
+                return messages.toast_override_start(self.config.override_minutes)
             return messages.toast_allow()
         if act == sm.NOTIFY_ALERT:
             return messages.toast_drift()
@@ -681,8 +693,23 @@ class Guardian:
         cmd = str(cmd).strip().lower()
         if cmd == "override_30min":
             self._start_override()
-        elif cmd == "pause":
-            if not self.paused:
+        elif cmd == "end_override":
+            # 手动立即结束临时放行：与自然到期同路径（fail-closed 恢复阻断）
+            if self._gstate.on_override:
+                self.override_until = None
+                self._counter.reset()
+                self._log_audit("end manual")
+                self._apply_event(sm.OVERRIDE_EXPIRE)
+                self.log.info("手动结束 Override：立即恢复阻断")
+        elif cmd in ("toggle_pause", "pause", "resume"):
+            # 合并后的菜单单项（✔=已暂停，点击切换）；pause/resume 兼容旧值
+            if cmd == "toggle_pause":
+                want_pause = not self.paused
+            elif cmd == "pause":
+                want_pause = True
+            else:  # resume
+                want_pause = False
+            if want_pause and not self.paused:
                 self.paused = True
                 self._counter.reset()
                 # 暂停语义 = 冻结在阻断态（fail-closed，安全优先）：
@@ -692,11 +719,12 @@ class Guardian:
                 self._gstate = sm.GateState(
                     sm.BLOCKED, self._gstate.drift_alarm, self._gstate.on_override)
                 self.log.info("守护已暂停（规则冻结在阻断态，不执行检查）")
-        elif cmd == "resume":
-            if self.paused:
+                self._notify(*messages.toast_paused())
+            elif not want_pause and self.paused:
                 self.paused = False
                 self._counter.reset()
                 self.log.info("守护已恢复")
+                self._notify(*messages.toast_resumed())
         elif cmd == "edit_whitelist":
             self._open_whitelist_editor()
         elif cmd == "show_details":
