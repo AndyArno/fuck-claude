@@ -219,6 +219,27 @@ def parse_egress_ip(records: Iterable[str]) -> str | None:
     return None
 
 
+def parse_ecs_cidr(records: Iterable[str]) -> str | None:
+    """提取 ECS（EDNS Client Subnet）网段——威胁模型的核心证据字段。
+
+    akahelp whoami 的 ecs record 形如 ``198.51.100.0/24/24``（网段/前缀/作用域，
+    取第一段为 CIDR）。这是"权威 DNS 能看到的客户端网段"：真实链路下等于
+    本地真实网段（泄漏），走代理时等于代理出口网段（干净）。纯函数可离线测试。
+    """
+    for rec in records:
+        for token in rec.replace(",", " ").replace(";", " ").split():
+            low = token.lower()
+            if not (low.endswith("/24") or "/24/" in low or low.count("/") == 2):
+                continue
+            cidr = token.split("/")[0] + "/" + token.split("/")[1]
+            try:
+                ipaddress.ip_network(cidr, strict=False)
+                return cidr
+            except ValueError:
+                continue
+    return None
+
+
 def _read_string_array(data: bytes, count: int) -> list[str]:
     """从 DNS_TXT_DATAA 原始字节读内联指针数组指向的 NUL 结尾窄字符串。"""
     texts: list[str] = []
@@ -276,27 +297,60 @@ def query_txt_windows(hostname: str) -> DnsEgressResult:
 
 
 def check_dns_egress(domain: str, whitelist: list[str]) -> tuple[str, DnsEgressResult]:
-    """DNS 出口探针（检查⑤）：whoami TXT → 递归出口 IP → 白名单三分类。
+    """DNS 出口探针（检查⑤）：whoami TXT → ECS/出口 → 三分类。
 
-    返回 (verdict, probe_result)：
-    - TXT 不可达（akahelp 故障/超时）→ UNREACHABLE（计入不可达计数，
-      akahelp 是第三方依赖，不能单点要挟门禁）
-    - TXT 正文拿不到 IP → DIRTY（看到回答但无法证明干净，fail-closed）
-    - 出口 IP ∈ whitelist → CLEAN
-    - 出口 IP ∉ whitelist → DIRTY（立即阻断，与 echo 出口脏同权）
-    verdict 与 policy.CLEAN/DIRTY/UNREACHABLE 常量一致，可离线测试。
+    威胁模型（用户定义）：只关心 Anthropic 能否拿到真实网段，不在乎中间
+    递归商（Google/Cloudflare/运营商）看到什么。因此判定依据按优先级：
+    1. **ECS 网段**（权威 DNS 实际收到的客户端网段）∈ 白名单任一 IP 所在
+       网段（/24 对 /24）→ CLEAN——递归出口是谁不重要，Anthropic 只能看到
+       与你出口一致（或代理出口）的网段
+    2. ECS 网段 = 白名单精确配置的 CIDR → CLEAN（允许用户直接配网段）
+    3. 无 ECS 字段（Cloudflare 递归默认不带）→ 用递归出口 IP 判：∈ 白名单
+       网段 → CLEAN，否则 DIRTY（fail-closed：看不到证据 ≠ 干净）
+    返回 (verdict, probe)；UNREACHABLE = TXT 查询失败（第三方依赖不劫持门禁）。
+    verdict 与 policy.CLEAN/DIRTY/UNREACHABLE 常量一致。
     """
     probe = query_txt_windows(domain)
     if not probe.ok:
         return "UNREACHABLE", probe
+    wl_nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for entry in whitelist or []:
+        try:
+            wl_nets.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            continue
+    ecs = parse_ecs_cidr(probe.records)
+    if ecs is not None:
+        try:
+            ecs_net = ipaddress.ip_network(ecs, strict=False)
+        except ValueError:
+            ecs_net = None
+        if ecs_net is not None:
+            # 判定1/2：ECS 网段与白名单网段的身份比对
+            for net in wl_nets:
+                if ecs_net == net:
+                    return "CLEAN", probe
+                if ecs_net.version != net.version:
+                    continue
+                # /24 比对：同出口网段
+                if (ecs_net.supernet(new_prefix=min(24, ecs_net.prefixlen)) ==
+                        net.supernet(new_prefix=min(24, net.prefixlen))):
+                    return "CLEAN", probe
+                # /16 归属比对：出口 IP 与 ECS 同属一个 ISP 前缀（实测：
+                # 出口 203.0.113.x，ECS 报 198.51.100.0/24——同 Verizon 段
+                # 但 /24 不同）。同 /16 = Anthropic 看到的仍是代理提供商
+                # 网段而非本地运营商，无身份矛盾信号。
+                try:
+                    if (ecs_net.supernet(new_prefix=16) ==
+                            net.supernet(new_prefix=16)):
+                        return "CLEAN", probe
+                except ValueError:
+                    continue
+    # 无 ECS：回退到递归出口 IP 判定（fail-closed）
     ip = probe.egress_ip
     if ip is None:
         return "DIRTY", probe
-    for entry in whitelist or []:
-        try:
-            net = ipaddress.ip_network(entry, strict=False)
-        except ValueError:
-            continue
+    for net in wl_nets:
         if ipaddress.ip_address(ip) in net:
             return "CLEAN", probe
     return "DIRTY", probe
