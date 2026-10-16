@@ -36,7 +36,8 @@ class Status:
     override_min_left: int | None = None  # 临时放行剩余分钟
     proxy_ok: bool | None = None     # Clash 代理在运行
     tunnel_ok: bool | None = None    # TUN 已接管流量
-    dns_ok: bool | None = None       # DNS 没有泄漏
+    dns_ok: bool | None = None       # DNS 没有泄漏（fake-ip 生效）
+    dns_leak_ip: str | None = None   # DNS 解析出口（检查⑤）；None=未探测/未泄漏
     probe_ok: bool | None = None     # 出口探测可达
     exit_ip: str | None = None
     in_whitelist: bool | None = None
@@ -66,6 +67,8 @@ def reason_text(s: Status) -> str:
         return "Clash 没有接管网络流量（TUN 模式未生效）"
     if s.dns_ok is False:
         return "存在 DNS 泄漏（Claude 域名解析绕过了代理）"
+    if s.dns_leak_ip is not None:
+        return f"DNS 泄漏（解析出口 {s.dns_leak_ip}，不在白名单）"
     if s.probe_ok is False:
         return "暂时无法确认出口 IP（探测失败，稍后重试）"
     if s.in_whitelist is False:

@@ -121,3 +121,44 @@ def test_multiple_errors_reported_together(tmp_path):
     msg = str(exc.value)
     assert "rule_name_v4" in msg and "whitelist" in msg and "blocked_cidrs_v4" in msg
     assert "共 3 处" in msg
+
+
+def test_dns_probe_domain_default(tmp_path):
+    c = cfg.load(write_cfg(tmp_path, VALID))
+    assert c.dns_probe_domain == "whoami.ds.akahelp.net"
+    # 未配置 dns_whitelist → 复用 whitelist
+    assert c.dns_whitelist == VALID["whitelist"]
+
+
+def test_dns_probe_domain_custom(tmp_path):
+    data = dict(VALID, dns_probe_domain="whoami.google.com")
+    c = cfg.load(write_cfg(tmp_path, data))
+    assert c.dns_probe_domain == "whoami.google.com"
+
+
+def test_dns_probe_domain_invalid(tmp_path):
+    data = dict(VALID, dns_probe_domain="")
+    with pytest.raises(cfg.ConfigError, match="dns_probe_domain"):
+        cfg.load(write_cfg(tmp_path, data))
+    data = dict(VALID, dns_probe_domain=42)
+    with pytest.raises(cfg.ConfigError, match="dns_probe_domain"):
+        cfg.load(write_cfg(tmp_path, data))
+
+
+def test_dns_whitelist_override(tmp_path):
+    data = dict(VALID, dns_whitelist=["198.51.100.20"])
+    c = cfg.load(write_cfg(tmp_path, data))
+    assert c.dns_whitelist == ["198.51.100.20"]
+    assert c.whitelist == VALID["whitelist"]
+
+
+def test_dns_whitelist_bad_ip(tmp_path):
+    data = dict(VALID, dns_whitelist=["999.999.1.1"])
+    with pytest.raises(cfg.ConfigError, match="dns_whitelist.*非法 IP"):
+        cfg.load(write_cfg(tmp_path, data))
+
+
+def test_dns_whitelist_wrong_type(tmp_path):
+    data = dict(VALID, dns_whitelist="203.0.113.10")
+    with pytest.raises(cfg.ConfigError, match="dns_whitelist"):
+        cfg.load(write_cfg(tmp_path, data))

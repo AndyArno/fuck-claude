@@ -131,6 +131,8 @@ class Guardian:
             1, round(config.slow_tick_sec / max(1, config.fast_tick_sec))
         )
         self._last_echo_ip: str | None = None
+        self._last_echo_in_whitelist: bool | None = None
+        self._last_dns_ip: str | None = None
         self._last_checks: dict[str, str] = {}
         self._config_mtime: float | None = self._stat_mtime()
         self._stop = threading.Event()
@@ -272,17 +274,38 @@ class Guardian:
         """慢路径一轮，返回状态机事件或 None（无事件）。"""
         fakeip_ok = self._check_fakeip()
         echo = self._probe_echo()
-        verdict = policy.classify(echo.ip if echo.ok else None,
-                                 list(self.config.whitelist))
+        verdict_before = policy.classify(echo.ip if echo.ok else None,
+                                         list(self.config.whitelist))
         self._last_echo_ip = echo.ip if echo.ok else self._last_echo_ip
+        # ⑤ DNS 出口探针：递归出口 IP 不在白名单与出口脏同权（立即阻断）；
+        # akahelp 不可达则 UNREACHABLE，计入现有不可达计数。
+        dns_verdict, dns_probe = self._probe_dns_egress()
+        # 综合：任一 DIRTY 即 DIRTY（立即阻断）；两者都 CLEAN 才算 CLEAN；
+        # 否则（echo 或 DNS 不可达）走 UNREACHABLE 计数语义。
+        if policy.DIRTY in (verdict_before, dns_verdict):
+            verdict = policy.DIRTY
+        elif verdict_before == policy.CLEAN and dns_verdict == policy.CLEAN:
+            verdict = policy.CLEAN
+        else:
+            verdict = policy.UNREACHABLE
+        self._last_dns_ip = dns_probe.egress_ip
+        self._last_echo_in_whitelist = (
+            verdict_before == policy.CLEAN if echo.ok else None)
         self._last_checks = {
             "mihomo进程": bool(local.mihomo_running),
             "TUN网卡": bool(local.tun_present),
             "fake-ip": bool(fakeip_ok),
             "echo出口": bool(echo.ok),
+            "DNS泄漏": dns_verdict == policy.CLEAN,
         }
-        self.log.info("慢路径：echo=%s fakeip=%s verdict=%s",
-                      echo.ip if echo.ok else f"不可达({echo.error})", fakeip_ok, verdict)
+        self.log.info(
+            "慢路径：echo=%s fakeip=%s dns=%s verdict=%s",
+            echo.ip if echo.ok else f"不可达({echo.error})",
+            fakeip_ok,
+            (dns_probe.egress_ip if dns_probe.ok
+             else f"不可达({dns_probe.error})"),
+            verdict,
+        )
 
         result = core_checks.evaluate(
             {
@@ -301,6 +324,21 @@ class Guardian:
         if verdict == policy.UNREACHABLE:
             return sm.PROBE_UNREACHABLE
         return None
+
+    def _probe_dns_egress(self):
+        """检查⑤：whoami TXT 探针，返回 (verdict, DnsEgressResult)。"""
+        try:
+            return self.dns.check_dns_egress(
+                self.config.dns_probe_domain, self.dns_whitelist)
+        except Exception as exc:
+            self.log.warning("DNS 出口探针异常：%s", exc)
+            return policy.UNREACHABLE, dnscheck.DnsEgressResult(
+                ok=False, error=str(exc))
+
+    @property
+    def dns_whitelist(self) -> list[str]:
+        """DNS 出口白名单：dns_whitelist 优先，缺省复用 echo 出口 whitelist。"""
+        return list(self.config.dns_whitelist or self.config.whitelist)
 
     def _check_fakeip(self) -> bool:
         try:
@@ -358,17 +396,28 @@ class Guardian:
             return messages.toast_drift()
         # NOTIFY_BLOCK：拦截态附大白话原因。
         # 排除法：快/慢检查里 proxy/tunnel/dns 任一失败即按该项解释；
-        # 否则若看到了出口 IP，说明 CHECK_FAIL 由“出口不在白名单”触发。
+        # 否则若看到了出口 IP，说明 CHECK_FAIL 由“出口不在白名单”触发；
+        # 否则若 DNS 出口探针看到白名单外 IP，按“DNS 泄漏”解释（检查⑤）。
         local = self._last_checks
         seen_ip = self._last_echo_ip is not None
-        s = messages.Status(
+        dns_leak = (local.get("DNS泄漏") is False
+                    and self._last_dns_ip is not None)
+        base = dict(
             blocking=True,
             proxy_ok=local.get("mihomo进程"),
             tunnel_ok=local.get("TUN网卡"),
             dns_ok=local.get("fake-ip"),
+        )
+        # 出口 IP 判脏优先于 DNS 泄漏（都脏时按出口解释）；仅 DNS 泄漏时按⑤解释
+        echo_dirty = seen_ip and self._last_echo_in_whitelist is False
+        if dns_leak and not echo_dirty:
+            return messages.toast_block(
+                messages.Status(dns_leak_ip=self._last_dns_ip, **base))
+        s = messages.Status(
             probe_ok=False if local.get("echo出口") is False else (None if not seen_ip else True),
             exit_ip=self._last_echo_ip,
             in_whitelist=False if seen_ip else None,
+            **base,
         )
         return messages.toast_block(s)
 
@@ -708,6 +757,7 @@ class Guardian:
                 state=state_map[self._gstate.state],
                 exit_ip=self._last_echo_ip or "未知",
                 whitelist_hit=bool(self._last_echo_ip),
+                dns_leak_ip=self._last_dns_ip,
                 checks=dict(self._last_checks),
                 paused=self.paused,
                 drift=self._gstate.drift_alarm,
@@ -735,6 +785,7 @@ def selfcheck(config: Config, logger: logging.Logger | None = None) -> int:
     exit_ip: str | None = None
     in_whitelist: bool | None = None
     echo_ok: bool | None = None
+    dns_leak_ip: str | None = None
 
     # ① mihomo 进程
     try:
@@ -765,18 +816,29 @@ def selfcheck(config: Config, logger: logging.Logger | None = None) -> int:
 
     fast_ok = mihomo and tun_ok
 
+    # ⑤ DNS 出口探针：递归出口不在白名单 → 泄漏，与出口脏同权
+    dns_verdict, dns_probe = dnscheck.check_dns_egress(
+        config.dns_probe_domain,
+        list(config.dns_whitelist or config.whitelist))
+    dns_leak_ip = dns_probe.egress_ip if dns_probe.ok else None
+    results["DNS泄漏"] = dns_verdict == policy.CLEAN
+
     # ---- 主结论（第一行防火墙状态 + 大白话原因）----
     # 主结论看全量检查：echo 判定 DIRTY 也算“防火墙应当拦截”（排除法：
     # 其余各项都正常时，不干净只能来自出口 IP 不在白名单）。
+    # 检查⑤ DNS 出口脏同权：akamai whoami 递归出口不在白名单 → 同样阻断。
     everything_else_ok = mihomo and tun_ok and fk_ok
     should_block = not fast_ok or (
         echo_ok is not None and in_whitelist is False and everything_else_ok
+    ) or (
+        dns_verdict == policy.DIRTY and everything_else_ok
     )
     status = messages.Status(
         blocking=should_block,
         proxy_ok=mihomo,
         tunnel_ok=tun_ok,
         dns_ok=fk_ok,
+        dns_leak_ip=dns_leak_ip if dns_verdict == policy.DIRTY else None,
         probe_ok=echo_ok,
         exit_ip=exit_ip,
         in_whitelist=in_whitelist,
@@ -801,6 +863,10 @@ def selfcheck(config: Config, logger: logging.Logger | None = None) -> int:
         print(f"④ echo 出口 IP: {echo.ip}（{echo.endpoint}）→ 白名单判定: {verdict}")
     else:
         print(f"④ echo 出口 IP: 不可达（{echo.error}）")
+    print(f"⑤ DNS 出口探针 ({config.dns_probe_domain}): "
+          f"判定={dns_verdict} 解析出口={dns_probe.egress_ip or '未知'}"
+          + (f" records={dns_probe.records}" if dns_probe.records else "")
+          + (f" error={dns_probe.error}" if dns_probe.error else ""))
     print(f"\n快路径判定: {'正常' if fast_ok else '失败（将立即阻断）'}")
-    print(f"四项检查: {results}")
+    print(f"五项检查: {results}")
     return 0 if fast_ok else 1

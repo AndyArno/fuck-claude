@@ -21,5 +21,6 @@
   "claude_domains": ["claude.ai", "api.anthropic.com", "anthropic.com", "console.anthropic.com"],
   "asn": "AS399358",
   "log_dir": "logs",
-  "log_retention_days": 30
+  "log_retention_days": 30,
+  "dns_probe_domain": "whoami.ds.akahelp.net"
 }

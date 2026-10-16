@@ -61,6 +61,8 @@ class Config:
     asn: str = ""
     log_dir: str = ""
     log_retention_days: int = 0
+    dns_probe_domain: str = "whoami.ds.akahelp.net"
+    dns_whitelist: list[str] = field(default_factory=list)
 
 
 def _require_str_nonempty(data: dict[str, Any], key: str, errors: list[str]) -> None:
@@ -126,6 +128,22 @@ def validate_config(data: Any) -> None:
     _validate_cidr_list(data, "blocked_cidrs_v6", errors)
     _validate_whitelist(data, errors)
 
+    # 可选 dns_whitelist：缺省复用 whitelist；给了就必须是合法 IP/CIDR 列表
+    dns_wl = data.get("dns_whitelist")
+    if dns_wl is not None:
+        if not isinstance(dns_wl, list) or not all(isinstance(x, str) for x in dns_wl):
+            errors.append(f"字段 'dns_whitelist' 必须是字符串列表（当前值: {dns_wl!r}）")
+        else:
+            for entry in dns_wl:
+                try:
+                    ipaddress.ip_network(entry, strict=False)
+                except ValueError:
+                    errors.append(f"字段 'dns_whitelist' 含非法 IP/CIDR: {entry!r}")
+    # 可选 dns_probe_domain：给了就必须是非空字符串
+    dpd = data.get("dns_probe_domain")
+    if dpd is not None and (not isinstance(dpd, str) or not dpd.strip()):
+        errors.append(f"字段 'dns_probe_domain' 必须是非空字符串（当前值: {dpd!r}）")
+
     if not data.get("echo_endpoints"):
         errors.append("字段 'echo_endpoints' 不能为空：阻断态探测依赖 echo 端点（G-5）")
     if not data.get("claude_domains"):
@@ -152,8 +170,14 @@ def load(path: str | Path) -> Config:
         raise ConfigError(f"配置文件不是合法 JSON: {p}（第 {exc.lineno} 行: {exc.msg}）") from exc
 
     validate_config(data)
-    return Config(
+    cfg = Config(
         **{f: data[f] for f in (
             _FIELDS_INT_POSITIVE + _FIELDS_STR_NONEMPTY + _FIELDS_STR_LIST
         )}
     )
+    # 可选字段：dns_probe_domain 有默认值；dns_whitelist 缺省复用 whitelist
+    object.__setattr__(cfg, "dns_probe_domain",
+                       data.get("dns_probe_domain", "whoami.ds.akahelp.net"))
+    object.__setattr__(cfg, "dns_whitelist",
+                       list(data.get("dns_whitelist") or data.get("whitelist") or []))
+    return cfg

@@ -13,6 +13,7 @@ import pytest
 
 import guardian
 from guardian import Guardian
+from core import policy
 from core import statemachine as sm
 from core.config import Config
 
@@ -105,6 +106,11 @@ class FakeDns:
 
     def doh_resolve(self, hostname, **kw):
         return guardian.dnscheck.DohResult(ok=True, addresses=("160.79.104.10",))
+
+    def check_dns_egress(self, domain, whitelist):
+        """检查⑤默认桩：出口 203.0.113.10 ∈ 默认白名单 → CLEAN。"""
+        return policy.CLEAN, guardian.dnscheck.DnsEgressResult(
+            ok=True, egress_ip="203.0.113.10", records=("ns", "203.0.113.10"))
 
 
 class FakeRipe:

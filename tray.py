@@ -56,6 +56,8 @@ class StateEvent:
     state: State
     exit_ip: str = "未知"
     whitelist_hit: bool = False
+    # 检查⑤ DNS 出口探针看到的解析出口 IP（None=未探测/干净）
+    dns_leak_ip: str | None = None
     # 四项检查结果：名称 -> bool（通过/失败）
     checks: dict = field(default_factory=dict)
     paused: bool = False
@@ -64,6 +66,7 @@ class StateEvent:
 
     def _status(self) -> Status:
         c = self.checks
+        dns_leak = self.dns_leak_ip if c.get("DNS泄漏") is False else None
         return Status(
             blocking=self.state is State.BLOCKED,
             paused=self.paused,
@@ -71,6 +74,7 @@ class StateEvent:
             proxy_ok=c.get("mihomo进程"),
             tunnel_ok=c.get("TUN网卡"),
             dns_ok=c.get("fake-ip"),
+            dns_leak_ip=dns_leak,
             probe_ok=c.get("echo出口"),
             exit_ip=self.exit_ip,
             in_whitelist=self.whitelist_hit,
@@ -104,6 +108,8 @@ class StateEvent:
                      + ("（临时放行中）" if self.override_active else ""))
         lines.append(f"出口 IP: {self.exit_ip}")
         lines.append(f"白名单命中: {'是' if self.whitelist_hit else '否'}")
+        if self.dns_leak_ip:
+            lines.append(f"DNS 解析出口: {self.dns_leak_ip}")
         for name, result in self.checks.items():
             shown = {True: "通过", False: "失败"}.get(result, "未探测")
             lines.append(f"{name}: {shown}")

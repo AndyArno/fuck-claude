@@ -9,11 +9,16 @@ Windows 门禁工具：mihomo（Clash Verge）未在正确代理链路时自动�
   （IPv6 永久封死，门禁无权放行）在程序未确认"走了代理"之前保持启用（阻断）。
 - **fail-closed**：任何异常——检查失败、探测不可达、进程退出、第三方改规则——
   都回落到阻断态。程序"退出"不会自动放行。
-- **四项检查**：
+- **五项检查**：
   1. mihomo 进程存活；
   2. TUN 网卡存在；
   3. fake-ip 生效（claude.ai 解析落在 198.18.0.0/15）；
-  4. echo 出口 IP 三分法：命中白名单 → 放行；落在封禁段 → 立即阻断；不可达 → 按阈值升级。
+  4. echo 出口 IP 三分法：命中白名单 → 放行；落在封禁段 → 立即阻断；不可达 → 按阈值升级；
+  5. DNS 出口干净（检查⑤）：向 `dns_probe_domain`（默认 `whoami.ds.akahelp.net`）发
+     TXT 查询（走系统 resolver，TUN 模式下经 mihomo 路由），从回答中提取实际递归
+     出口 IP。不在白名单（`dns_whitelist`，缺省复用 `whitelist`）→ 立即阻断
+     （DNS 泄漏 = 出口脏，Anthropic 可借此看到真实运营商 DNS 出口）；
+     探针不可达 → 计入不可达阈值，不单点要挟门禁。
 - **漂移监控**：定期经 DoH 解析 Claude 域名、查 RIPE 上 ASN 宣告段，
   发现 IP 段漂移时托盘黄色告警（只提醒，不动规则）。
 - **配置热生效**：托盘"编辑白名单"打开 `config.json`，保存后无需重启，
@@ -43,7 +48,7 @@ Remove-NetFirewallRule -DisplayName 'CG-Global','CG-V6' -ErrorAction SilentlyCon
 
 ## 安装
 
-1. 把以上四项放到同一个目录（建议 `C:\Tools\ClaudeGuard\`）；
+1. 把以上文件放到同一个目录（建议 `C:\Tools\ClaudeGuard\`）；
    **确认 config.json 与 ClaudeGuard.exe 同目录**。
 2. 双击 `ClaudeGuard.exe`，同意 UAC，托盘出现图标即运行正常。
 3. 右键 `install_task.ps1` → "使用 PowerShell 运行"（需管理员），
@@ -74,19 +79,19 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 三步排查法：
 
 1. **看托盘颜色**
-   - 🔴 红（阻断）：四项检查未全过，门禁正在阻断——这是设计行为。
+   - 🔴 红（阻断）：五项检查未全过，门禁正在阻断——这是设计行为。
    - 🟡 黄（探测中/暂停/漂移）：检查进行中，或配置了漂移告警（看日志确认）。
    - 🟢 绿（放行）：门禁认为链路正常，问题不在此工具（查 mihomo/节点本身）。
    - 图标消失：程序未运行。`Start-ScheduledTask -TaskName ClaudeGuard` 手动启动。
 
 2. **看日志**：打开 `logs\guard-YYYYMMDD.log`（按天滚动），搜索 `ERROR`/`状态转移`，
-   关注四项检查哪一项失败、防火墙调用是否失败（PowerShell 冷启动首次可达 13 秒）。
+   关注五项检查哪一项失败、防火墙调用是否失败（PowerShell 冷启动首次可达 13 秒）。
 
 3. **手动自检**：管理员终端运行
    ```powershell
    .\ClaudeGuard.exe --check
    ```
-   只读模式，不改防火墙。输出四项检查逐项结果 + 图标资源自检，
+   只读模式，不改防火墙。输出五项检查逐项结果 + 图标资源自检，
    逐条对照第 1 步的颜色判断根因。
 
 ## 配置说明（config.json）
