@@ -1,0 +1,25 @@
+{
+  "blocked_cidrs_v4": ["160.79.104.0/23"],
+  "blocked_cidrs_v6": ["2607:6bc0::/48", "2607:6bc0:11::/48"],
+  "rule_name_v4": "CG-Global",
+  "rule_name_v6": "CG-V6",
+  "whitelist": ["203.0.113.10"],
+  "echo_endpoints": [
+    "https://www.cloudflare.com/cdn-cgi/trace",
+    "https://api.ip.sb/ip"
+  ],
+  "fakeip_range": "198.18.0.0/15",
+  "mihomo_process": "verge-mihomo.exe",
+  "tun_adapter_keywords": ["mihomo", "clash", "utun", "verge"],
+  "fast_tick_sec": 1,
+  "slow_tick_sec": 5,
+  "pass_confirm_count": 3,
+  "fail_unreachable_threshold": 5,
+  "doh_check_interval_min": 60,
+  "ripe_check_interval_hours": 24,
+  "override_minutes": 30,
+  "claude_domains": ["claude.ai", "api.anthropic.com", "anthropic.com", "console.anthropic.com"],
+  "asn": "AS399358",
+  "log_dir": "logs",
+  "log_retention_days": 30
+}

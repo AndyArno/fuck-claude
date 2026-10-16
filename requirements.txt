@@ -1,0 +1,7 @@
+pystray==0.19.5
+Pillow==11.2.1
+requests==2.32.3
+psutil==7.0.0
+win11toast==0.35
+pytest==8.3.5
+PyInstaller==6.11.1
