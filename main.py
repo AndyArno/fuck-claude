@@ -18,6 +18,7 @@ if not getattr(sys, "frozen", False):
         sys.path.insert(0, str(_ROOT))
 
 from scripts.run_guardian import main  # noqa: E402
+from winplat.winmsg import message_box as _message_box  # noqa: E402
 
 
 def _frozen_check() -> int:
@@ -54,16 +55,6 @@ def _frozen_check() -> int:
         print("图标资源自检: 失败")
     _message_box("Claude Guard 自检结果", buf.getvalue(), error=code != 0)
     return code
-
-
-def _message_box(title: str, text: str, *, error: bool = False) -> None:
-    try:
-        import ctypes
-
-        ctypes.windll.user32.MessageBoxW(
-            None, text, title, (0x10 if error else 0x40))  # MB_ICONERROR / MB_ICONINFORMATION
-    except Exception:
-        print(text)
 
 
 if __name__ == "__main__":

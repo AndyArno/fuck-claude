@@ -18,7 +18,7 @@ import pystray
 from PIL import Image
 
 from winplat.assets import icon_file
-from winplat.notify import notify_details, notify_state
+from winplat.winmsg import message_box_async
 from core.messages import (
     DRIFT_HINT,
     Status,
@@ -196,11 +196,15 @@ class Tray:
         )
 
     def _show_details(self, icon, item) -> None:
-        """状态详情：投递命令，同时用气泡展示最近一次事件的四项检查文本。"""
+        """状态详情：投递命令，同时弹出真窗口展示最近一次事件的完整详情。
+
+        MessageBoxW 在独立 daemon 线程弹出（线程内模态），托盘消息泵与
+        guardian 主循环均不受阻塞；窗口由用户点"确定"关闭。"""
         self.commands.put(Command.SHOW_DETAILS)
         evt = self._last_event
         if evt is not None:
-            notify_details("Claude Guard 状态详情", evt.detail_lines())
+            message_box_async("Claude Guard 状态详情",
+                              "\n".join(evt.detail_lines()))
 
 
 # os.startfile 编辑白名单属于业务副作用，由 guardian 执行 Command.EDIT_WHITELIST 时调用

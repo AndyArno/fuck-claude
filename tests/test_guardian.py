@@ -1254,3 +1254,61 @@ class TestFakeipLifecycle:
         assert g.config.claude_domains == ["claude.ai", "api.anthropic.com"]
         assert calls["n"] >= 2
         assert fw.fakeip_ips == ["198.18.0.1"]
+
+
+# ----------------------------------------------------------------- fake-ip 迁移刷新
+
+class TestFakeipMigrationRefresh:
+    def test_transition_triggers_fakeip_refresh(self, tmp_path):
+        """状态迁移 set _fakeip_wake → fakeip-refresh 线程立即重采集重建
+        CG-FakeIP（不等慢路径 5s）。"""
+        import socket as s
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        g._fakeip_thread = threading.Thread(
+            target=g._fakeip_refresh_loop, name="fakeip-refresh", daemon=True)
+        g._fakeip_thread.start()
+        current = {"ips": ["198.18.0.1"]}
+
+        def ga(host, *a, **k):
+            return [(2, 1, 6, "", (ip, 0)) for ip in current["ips"]]
+
+        real = s.getaddrinfo
+        s.getaddrinfo = ga
+        try:
+            # 迁移前集合已知；迁移点换新 fake-ip 并触发
+            g._fakeip_rule_ips = ("198.18.0.1",)
+            current["ips"] = ["198.18.0.7"]
+            np = getattr(g, "np")
+            np.mihomo = False  # FAST_FAIL → BLOCKED 迁移
+            g._gstate = sm.GateState(state=sm.ALLOWED)
+            fw.global_enabled = False
+            g._apply_event(sm.FAST_FAIL)
+            assert wait_for_calls(fw, "create_rule_fakeip", 1, timeout=5)
+            assert fw.fakeip_ips == ["198.18.0.7"]
+        finally:
+            s.getaddrinfo = real
+            g._stop.set()
+            g._fakeip_wake.set()
+            g._fakeip_thread.join(timeout=5)
+
+    def test_transition_wake_immediately_not_slow_tick(self, tmp_path):
+        """迁移触发即刷新：不再依赖 _tick_count 到慢路径轮次。"""
+        np = FakeNetprobe(echo_ip="203.0.113.9")  # 白名单外 → DIRTY
+        g, fw, *_ , _ = make_guardian(tmp_path, np=np)
+        g._gstate = sm.GateState(state=sm.ALLOWED)
+        fw.global_enabled = False
+        before = fw.calls.count("create_rule_fakeip")
+        g._tick_count = 0  # 本轮慢路径不跑（% 5 != 0），只靠迁移唤醒
+        # 慢路径刷新未跑，规则内集合还是旧值 → 唤醒线程必须自己重采集
+        g._fakeip_thread = threading.Thread(
+            target=g._fakeip_refresh_loop, name="fakeip-refresh", daemon=True)
+        g._fakeip_thread.start()
+        g._tick_count = 1
+        event = None
+        np.mihomo = False  # 走快路径 FAST_FAIL（纯迁移，无慢路径 fakeip 刷新）
+        g.tick()
+        assert g._gstate.state == sm.BLOCKED
+        assert wait_for_calls(fw, "create_rule_fakeip", before + 1, timeout=5)
+        g._stop.set()
+        g._fakeip_wake.set()
+        g._fakeip_thread.join(timeout=5)

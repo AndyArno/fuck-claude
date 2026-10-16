@@ -156,6 +156,11 @@ class Guardian:
         self._fw_lock = threading.Lock()
         self._heal_wake = threading.Event()   # 主循环 → heal 线程：立即 heal
         self._heal_thread: threading.Thread | None = None
+        # fake-ip 迁移刷新（时序残余修复）：状态迁移后立即重采集重建
+        # CG-FakeIP，不等慢路径 5s。重采集有 getaddrinfo + PS 开销，
+        # 也放独立线程（failip-refresh），绝不阻塞主循环快路径。
+        self._fakeip_wake = threading.Event()  # 主循环 → refresh 线程：立即刷新
+        self._fakeip_thread: threading.Thread | None = None
 
         self._tick_count = 0
         self._slow_every = max(
@@ -192,6 +197,10 @@ class Guardian:
             target=self._heal_loop, name="rule-heal", daemon=True
         )
         self._heal_thread.start()
+        self._fakeip_thread = threading.Thread(
+            target=self._fakeip_refresh_loop, name="fakeip-refresh", daemon=True
+        )
+        self._fakeip_thread.start()
         self._thread = threading.Thread(target=self.run, name="guardian-main", daemon=True)
         self._thread.start()
 
@@ -203,6 +212,9 @@ class Guardian:
             self._thread.join(timeout=timeout)
         if self._heal_thread is not None:
             self._heal_thread.join(timeout=3.0)
+        self._fakeip_wake.set()
+        if self._fakeip_thread is not None:
+            self._fakeip_thread.join(timeout=3.0)
         if self._drift_thread is not None:
             self._drift_thread.join(timeout=2.0)
 
@@ -440,6 +452,10 @@ class Guardian:
             # 迁移点的 enable/disable 已是权威写入，本次校验是防线不是主路径；
             # 若 heal 线程正在跑一轮，事件不排队、合并成"结束后尽早再跑一轮"。
             self._heal_wake.set()
+            # fake-ip 迁移刷新：迁移点立即重采集重建 CG-FakeIP。Clash 重启后
+            # fake-ip 重分配，访问可能落在"新 fake-ip 生效、规则未重建"的
+            # 慢路径 5s 间隙——迁移后首轮必须立即把新集合写进规则。
+            self._fakeip_wake.set()
 
     def _execute(self, actions: list[dict]) -> None:
         for a in actions:
@@ -555,6 +571,21 @@ class Guardian:
             # 周期等待；主循环迁移触发 set _heal_wake → 提前唤醒立即校验
             if self._heal_wake.wait(timeout=delay):
                 self._heal_wake.clear()
+
+    def _fakeip_refresh_loop(self) -> None:
+        """fake-ip 刷新线程：平时随慢路径节奏（_slow_path 每轮已调用
+        _refresh_fakeip_rule）；状态迁移时被 _fakeip_wake 唤醒立即重采集
+        重建 CG-FakeIP。阻塞型迁移场景（如暂停/恢复期间无慢路径）也由本
+        线程兜底。异常续命，永不退出（除 stop）。"""
+        while not self._stop.is_set():
+            if self._fakeip_wake.wait():
+                self._fakeip_wake.clear()
+            if self._stop.is_set():
+                return
+            try:
+                self._refresh_fakeip_rule()
+            except Exception as exc:
+                self.log.warning("迁移后 fake-ip 刷新失败（慢路径重试）：%s", exc)
 
     def _self_heal_rules(self) -> None:
         """校验 CG-Global 实际状态与状态机期望一致；CG-V6 永久封死。
