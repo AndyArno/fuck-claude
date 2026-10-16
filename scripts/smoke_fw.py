@@ -37,13 +37,21 @@ def is_admin() -> bool:
         return False
 
 
-def connect_result(host: str = "claude.ai", port: int = 443, timeout: float = 5.0) -> str:
-    """返回 'REACHED' / 'REFUSED' / 'ERROR:<msg>'。"""
+def connect_result(host: str, port: int = 443, timeout: float = 5.0) -> str:
+    """返回 'REACHED' / 'BLOCKED (...)'。
+
+    注意：Clash TUN + fake-ip 环境下，connect("claude.ai") 解析到 198.18.x.x
+    经 TUN→mihomo→远程代理，本机不发出目的为 Anthropic 真实 IP 的包，
+    WFP 规则测不出效果。必须直连真实 IP 才能验证阻断语义。"""
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return "REACHED"
     except OSError as exc:
-        return f"REFUSED ({exc.__class__.__name__})"
+        return f"BLOCKED ({exc.__class__.__name__})"
+
+
+# Anthropic 边缘节点真实 IP（docs/01-requirements.md §4 环境事实：四个域名同 IP）
+CLAUDE_REAL_IP = "160.79.104.10"
 
 
 def main() -> int:
@@ -60,13 +68,13 @@ def main() -> int:
             "$n=" + _q(v4) + ";"
             "if (Get-NetFirewallRule -DisplayName $n -EA SilentlyContinue){Remove-NetFirewallRule -DisplayName $n};"
             "New-NetFirewallRule -DisplayName $n -Direction Outbound -Action Block -Enabled True"
-            " -Protocol TCP -RemoteAddress " + _q(",".join(cfg["blocked_cidrs_v4"])) + "|Out-Null"
+            " -Protocol TCP -RemoteAddress " + _ps_array(cfg["blocked_cidrs_v4"]) + "|Out-Null"
         )
         ps(
             "$n=" + _q(v6) + ";"
             "if (Get-NetFirewallRule -DisplayName $n -EA SilentlyContinue){Remove-NetFirewallRule -DisplayName $n};"
             "New-NetFirewallRule -DisplayName $n -Direction Outbound -Action Block -Enabled True"
-            " -Protocol TCP -RemoteAddress " + _q(",".join(cfg["blocked_cidrs_v6"])) + "|Out-Null"
+            " -Protocol TCP -RemoteAddress " + _ps_array(cfg["blocked_cidrs_v6"]) + "|Out-Null"
         )
     except subprocess.TimeoutExpired:
         if not admin:
@@ -95,16 +103,16 @@ def main() -> int:
         return 0
 
     # 2. 阻断验证
-    print(f"[smoke_fw] BLOCKED phase: {connect_result()}")
+    print(f"[smoke_fw] BLOCKED phase (direct {CLAUDE_REAL_IP}): {connect_result(CLAUDE_REAL_IP)}")
     # 3. 放行验证
     print("[smoke_fw] disabling CG-Global ...")
     ps("Disable-NetFirewallRule -DisplayName " + _q(v4))
-    print(f"[smoke_fw] ALLOWED phase: {connect_result()}")
+    print(f"[smoke_fw] ALLOWED phase (direct {CLAUDE_REAL_IP}): {connect_result(CLAUDE_REAL_IP)}")
 
     # 4. 存量 TCP 连接行为实测
     print("[smoke_fw] opening TCP connection to claude.ai for existing-conn test ...")
     try:
-        s = socket.create_connection(("claude.ai", 443), timeout=5)
+        s = socket.create_connection((CLAUDE_REAL_IP, 443), timeout=5)
     except OSError as exc:
         print(f"[smoke_fw] SKIP existing-conn test: pre-open failed ({exc})")
         s = None
@@ -134,6 +142,8 @@ def main() -> int:
 
 def _q(v: str) -> str:
     return "'" + v.replace("'", "''") + "'"
+def _ps_array(values: list) -> str:
+    return "@(" + ",".join(_q(v) for v in values) + ")"
 
 
 if __name__ == "__main__":

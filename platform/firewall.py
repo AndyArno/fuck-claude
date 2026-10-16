@@ -45,6 +45,10 @@ class RuleNotFoundError(FirewallError):
 def _ps_quote(value: str) -> str:
     """把参数安全嵌入 PowerShell 单引号字符串（单引号翻倍转义）。"""
     return "'" + value.replace("'", "''") + "'"
+def _ps_array(values: list[str]) -> str:
+    """把 CIDR 列表编码为 PowerShell 数组字面量（逗号拼接的 IPv6 CIDR 列表会被
+    NetSecurity 判为非法地址——已实测；数组语法 v4/v6 均通过）。"""
+    return "@(" + ",".join(_ps_quote(v) for v in values) + ")"
 
 
 def _run_ps(script: str) -> str:
@@ -108,7 +112,7 @@ def _is_access_denied(output: str) -> bool:
 def create_rule(config: Config) -> None:
     """创建（或覆盖重建）CG-Global 规则，阻断 blocked_cidrs_v4 全出站。"""
     name = _ps_quote(config.rule_name_v4)
-    remote = _ps_quote(",".join(config.blocked_cidrs_v4))
+    remote = _ps_array(config.blocked_cidrs_v4)
     script = (
         f"$existing = Get-NetFirewallRule -DisplayName {name} -ErrorAction SilentlyContinue; "
         f"if ($existing) {{ Remove-NetFirewallRule -DisplayName {name} -ErrorAction Stop }}; "
@@ -166,7 +170,7 @@ def ensure_exists(config: Config) -> None:
 def create_rule_v6(config: Config) -> None:
     """创建（或覆盖重建）CG-V6 规则，永久阻断 blocked_cidrs_v6。"""
     name = _ps_quote(config.rule_name_v6)
-    remote = _ps_quote(",".join(config.blocked_cidrs_v6))
+    remote = _ps_array(config.blocked_cidrs_v6)
     script = (
         f"$existing = Get-NetFirewallRule -DisplayName {name} -ErrorAction SilentlyContinue; "
         f"if ($existing) {{ Remove-NetFirewallRule -DisplayName {name} -ErrorAction Stop }}; "
