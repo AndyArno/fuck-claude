@@ -90,8 +90,17 @@ main.py / scripts/run_guardian.py   打包入口 / 开发态入口（共用 main
 .venv/Scripts/python -m PyInstaller claude-guard.spec --noconfirm
 ```
 
-- git commit 信息用中文，格式 `<类型>(<范围>)?: <描述>——<关键实测证据>`。
-- 不要提交 dist/ logs/ build/（gitignore 已排除）；config.json 提交（模板即真实配置，白名单是用户自己的 IP）。
+- **git 提交信息一律中文**，格式 `<类型>(<范围>)?: <描述>——<关键实测证据>`
+  （例：`fix: PS 子进程加 CREATE_NO_WINDOW——托盘切换不再闪黑窗`）。
+- **【安全红线】禁止向 git 提交任何用户敏感信息**：真实出口 IP、DNS 递归出口、
+  本地网段（ECS）、节点/机场信息。此仓库曾因此全历史重写（59a0232）。
+  - `config.json` 已被 gitignore 排除（真实白名单在内），**永远不要 `git add -f config.json`**；
+    需要改配置 schema 时改 `config.example.json`（模板，IP 用 RFC 5737 保留地址
+    203.0.113.x / 198.51.100.x）
+  - 测试/文档里需要示例 IP 时只用 RFC 5737 保留地址或文档段，**禁止**复制实机输出里的真实 IP
+  - 提交前自查：`git diff --cached | grep -E "63\.125|183\.232|23\.132|172\.253|103\.142"`
+    （模式按已知真实 IP 维护）；子代理的实测报告属于会话产物，不入库
+- 不要提交 dist/ logs/ build/（gitignore 已排除）。
 - 改动 firewall.py 后必须实机验证（管理员窗口可用 `net session` 探测）：
   规则创建/三态读取/enable 假成功检测，跑 `smoke_fw.py`。
 - 测试原则：core 层纯逻辑全单测；winplat 解析函数离线单测（喂样本文本，不发网络）；
