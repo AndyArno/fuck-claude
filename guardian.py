@@ -676,7 +676,10 @@ class Guardian:
     # ------------------------------------------------------------------ 托盘命令
 
     def _drain_commands(self) -> bool:
-        """处理托盘命令队列；返回 False 表示退出。"""
+        """处理托盘命令队列；返回 False 表示退出。
+
+        命令处理完立即推送托盘状态：菜单✔/临时放行项的更新不等 tick
+        末尾的统一推送（点击后最快路径反映，实测"跟手"的关键）。"""
         if self.tray is None:
             return True
         while True:
@@ -687,6 +690,7 @@ class Guardian:
             value = cmd.value if hasattr(cmd, "value") else str(cmd)
             if self.handle_command(value) is False:
                 return False
+            self._push_tray()
 
     def handle_command(self, cmd: str) -> bool:
         """处理一条菜单命令；返回 False 表示退出主循环。"""

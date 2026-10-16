@@ -178,6 +178,10 @@ class Tray:
                 pass  # UI 更新失败不影响守护
 
     def _apply(self, evt: StateEvent) -> None:
+        # 先更新 _last_event 再重建菜单：菜单项的 visible/checked/enabled
+        # lambda 读的是 _last_event，顺序反了菜单显示旧状态（✔ 滞后一轮，
+        # 用户实测"不跟手"）。
+        self._last_event = evt
         if self._icon is not None:  # 测试环境未 run_detached 时跳过 UI 更新
             color = evt.icon_color()
             img = self._icons[color]
@@ -190,7 +194,6 @@ class Tray:
                 self._icon.update_menu()
             except Exception:
                 pass  # 菜单更新失败不影响守护
-        self._last_event = evt
         # 详情窗开着期间实时刷新（状态变化/新检查结果立即反映）
         with self._detail_lock:
             if self._detail_box is not None and not self._detail_box.closed:
@@ -233,7 +236,9 @@ class Tray:
                 visible=lambda item: self._on_override(),
             ),
             pystray.MenuItem(
-                "暂停守护（✔=已暂停，点击切换）",
+                # 原生左侧勾选标记（MFS_CHECKED）表示暂停状态，
+                # 文字保持稳定不随状态变——同截图 TUN 模式的样式
+                "暂停守护",
                 self._menu_cb(Command.TOGGLE_PAUSE),
                 checked=lambda item: self._paused(),
             ),
