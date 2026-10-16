@@ -75,7 +75,11 @@ def main(argv: list[str], config_path: Path | None = None) -> int:
     guardian.start()
 
     try:
-        while not stop_done.wait(timeout=1.0):
+        # 等三种退出信号：守护主循环自然退出（exited） / 线程意外死亡 / 信号
+        while True:
+            if guardian.exited.wait(timeout=1.0):
+                log.info("Guardian 主循环已退出，清理进程")
+                break
             if not guardian._thread.is_alive():  # noqa: SLF001 - 入口巡检
                 log.error("Guardian 主循环线程意外退出，停止进程")
                 break
@@ -85,7 +89,14 @@ def main(argv: list[str], config_path: Path | None = None) -> int:
     finally:
         tray.stop()
         log.info("===== Claude Guard 已退出 =====")
-    return 0
+    # 托盘 exe 兜底：pystray Win32 消息泵等非 daemon 线程在 windowed
+    # exe 下偶发不随 icon.stop() 结束（实测：用户点退出后主循环已退出、
+    # 进程仍挂活）。规则状态此时已由 exit 命令恢复阻断，强杀进程不破坏
+    # fail-closed 语义。
+    import os
+
+    os._exit(0)
+    return 0  # noqa: UNR 不可达
 
 
 if __name__ == "__main__":

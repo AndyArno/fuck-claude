@@ -134,6 +134,7 @@ class Guardian:
         self._last_checks: dict[str, str] = {}
         self._config_mtime: float | None = self._stat_mtime()
         self._stop = threading.Event()
+        self.exited = threading.Event()      # 主循环结束标志（入口感知退出）
         self._thread: threading.Thread | None = None
         # 漂移线程 → 主循环事件队列（也用于内部停止标记）
         self._incoming: queue.Queue = queue.Queue()
@@ -181,6 +182,9 @@ class Guardian:
                 self.log.exception("tick 异常（继续运行，fail-closed）")
             self._sleep(self.config.fast_tick_sec)
         self.log.info("Guardian 主循环退出")
+        self.exited.set()  # 通知入口：主循环已结束（不依赖 is_alive 轮询）
+        # 托盘"退出"由 handle_command 完成 enable 后走到这里；被外部 stop()
+        # 时同样成立。入口 finally 兜底 os._exit 保证进程死透。
 
     # ------------------------------------------------------------------ 单轮 tick
 
