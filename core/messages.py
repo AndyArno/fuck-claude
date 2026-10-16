@@ -55,7 +55,10 @@ def status_line(s: Status) -> str:
             return "⏳ 已临时放行 Claude"
         return f"⏳ 已临时放行 Claude（剩余 {s.override_min_left} 分钟）"
     if s.blocking:
-        return "🛡 防火墙正在拦截 Claude（安全，无泄漏风险）"
+        # 拦截原因有两种：环境有风险（出口脏/DNS 泄漏/Clash 异常）→ 风险真实
+        # 存在，阻断只是挡住使用；未开 Clash → 风险尚未发生。文案不能断言
+        # "无泄漏风险"（曾有 DNS 泄漏态显示该字样自相矛盾，用户实测发现）。
+        return "🛡 防火墙正在拦截 Claude（已阻断风险连接）"
     return "✅ 防火墙已放行 Claude（出口 IP 干净）"
 
 

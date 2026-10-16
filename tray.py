@@ -58,7 +58,7 @@ class StateEvent:
     whitelist_hit: bool = False
     # 检查⑤ DNS 出口探针看到的解析出口 IP（None=未探测/干净）
     dns_leak_ip: str | None = None
-    # 四项检查结果：名称 -> bool（通过/失败）
+    # 检查结果：名称 -> bool（True=通过 False=失败）
     checks: dict = field(default_factory=dict)
     paused: bool = False
     drift: bool = False
@@ -66,7 +66,7 @@ class StateEvent:
 
     def _status(self) -> Status:
         c = self.checks
-        dns_leak = self.dns_leak_ip if c.get("DNS泄漏") is False else None
+        dns_leak = self.dns_leak_ip if c.get("DNS出口干净") is False else None
         return Status(
             blocking=self.state is State.BLOCKED,
             paused=self.paused,

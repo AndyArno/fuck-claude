@@ -133,7 +133,7 @@ class TestGuardianDnsEgress:
         _slow_tick(g)
         # echo + DNS 都 CLEAN → 继续 HOLD（确认窗），不回阻断
         assert g._gstate.state == guardian.sm.ALLOWED
-        assert g._last_checks["DNS泄漏"] is True
+        assert g._last_checks["DNS出口干净"] is True
 
     def test_dns_dirty_blocks_immediately(self, tmp_path):
         import tests.test_guardian as guardian_tests
@@ -144,7 +144,7 @@ class TestGuardianDnsEgress:
         _slow_tick(g)
         assert g._gstate.state == guardian.sm.BLOCKED
         assert fw.global_enabled is True
-        assert g._last_checks["DNS泄漏"] is False
+        assert g._last_checks["DNS出口干净"] is False
         assert g._last_dns_ip == "198.51.100.20"
 
     def test_dns_unreachable_counts_as_unreachable(self, tmp_path):
@@ -198,7 +198,7 @@ class TestGuardianDnsEgress:
             whitelist_hit=True,
             dns_leak_ip="198.51.100.20",
             checks={"mihomo进程": True, "TUN网卡": True, "fake-ip": True,
-                    "echo出口": True, "DNS泄漏": False},
+                    "echo出口": True, "DNS出口干净": False},
         )
         lines = evt.detail_lines()
         assert any("198.51.100.20" in ln for ln in lines)

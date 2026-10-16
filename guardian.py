@@ -362,7 +362,7 @@ class Guardian:
             "TUN网卡": bool(local.tun_present),
             "fake-ip": bool(fakeip_ok),
             "echo出口": bool(echo.ok),
-            "DNS泄漏": dns_verdict == policy.CLEAN,
+            "DNS出口干净": dns_verdict == policy.CLEAN,
         }
         self.log.info(
             "慢路径：echo=%s fakeip=%s dns=%s verdict=%s",
@@ -469,7 +469,7 @@ class Guardian:
         # 否则若 DNS 出口探针看到白名单外 IP，按“DNS 泄漏”解释（检查⑤）。
         local = self._last_checks
         seen_ip = self._last_echo_ip is not None
-        dns_leak = (local.get("DNS泄漏") is False
+        dns_leak = (local.get("DNS出口干净") is False
                     and self._last_dns_ip is not None)
         base = dict(
             blocking=True,
@@ -953,7 +953,7 @@ def selfcheck(config: Config, logger: logging.Logger | None = None) -> int:
         config.dns_probe_domain,
         list(config.dns_whitelist or config.whitelist))
     dns_leak_ip = dns_probe.egress_ip if dns_probe.ok else None
-    results["DNS泄漏"] = dns_verdict == policy.CLEAN
+    results["DNS出口干净"] = dns_verdict == policy.CLEAN
 
     # ---- 主结论（第一行防火墙状态 + 大白话原因）----
     # 主结论看全量检查：echo 判定 DIRTY 也算“防火墙应当拦截”（排除法：
