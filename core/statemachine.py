@@ -62,7 +62,7 @@ def transition(state: GateState, event: str) -> Transition:
         if state.drift_alarm:
             return Transition(state)  # idempotent, no repeat notification
         return Transition(state.with_drift(), [{"action": NOTIFY_ALERT,
-                                                "message": "漂移告警：封禁段覆盖可能失效"}])
+                                                "message": "IP 段漂移告警"}])
 
     # Override is active: checks must not block (matrix #6). Only expiry
     # or a state-external force changes anything.
@@ -77,7 +77,7 @@ def transition(state: GateState, event: str) -> Transition:
     if event == OVERRIDE_EXPIRE:
         return Transition(GateState(BLOCKED, state.drift_alarm, False),
                           [{"action": ENABLE_FIREWALL},
-                           {"action": NOTIFY_BLOCK, "message": "临时放行结束，已恢复阻断"}])
+                           {"action": NOTIFY_BLOCK, "message": "临时放行结束"}])
 
     if event == FAST_FAIL:
         if state.state == BLOCKED:
@@ -87,13 +87,13 @@ def transition(state: GateState, event: str) -> Transition:
         # no confirmation window, no tolerance.
         return Transition(GateState(BLOCKED, state.drift_alarm, False),
                           [{"action": ENABLE_FIREWALL},
-                           {"action": NOTIFY_BLOCK, "message": "代理进程/TUN 消失，已立即阻断"}])
+                           {"action": NOTIFY_BLOCK, "message": "fast_fail"}])
 
     if event == CHECK_FAIL:
         # DIRTY exit or local check failure: immediate block, no tolerance (G-4).
         return Transition(GateState(BLOCKED, state.drift_alarm, False),
                           [{"action": ENABLE_FIREWALL},
-                           {"action": NOTIFY_BLOCK, "message": "检查失败，已阻断"}])
+                           {"action": NOTIFY_BLOCK, "message": "check_fail"}])
 
     if event == PROBE_UNREACHABLE:
         # Counting escalation happens in checks.py; the state machine only

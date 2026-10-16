@@ -19,6 +19,14 @@ from PIL import Image
 
 from platform.assets import icon_file
 from platform.notify import notify_details, notify_state
+from core.messages import (
+    DRIFT_HINT,
+    Status,
+    TECH_SEPARATOR,
+    reason_line,
+    status_line,
+    tooltip as tooltip_text,
+)
 
 
 class State(enum.Enum):
@@ -39,16 +47,34 @@ class Command(enum.Enum):
 
 @dataclass
 class StateEvent:
-    """guardian -> tray 的状态摘要事件。"""
+    """guardian -> tray 的状态摘要事件。
+
+    checks 仅承载各检查项是否通过（None=未探测），不携带文案；
+    用户可见文案统一由 core.messages 生成。
+    """
 
     state: State
     exit_ip: str = "未知"
     whitelist_hit: bool = False
-    # 四项检查结果：名称 -> "通过"/"失败"/"未探测" 之类的短文本
+    # 四项检查结果：名称 -> bool（通过/失败）
     checks: dict = field(default_factory=dict)
     paused: bool = False
     drift: bool = False
     override_active: bool = False
+
+    def _status(self) -> Status:
+        c = self.checks
+        return Status(
+            blocking=self.state is State.BLOCKED,
+            paused=self.paused,
+            override_min_left=(-1 if self.override_active else None),
+            proxy_ok=c.get("mihomo进程"),
+            tunnel_ok=c.get("TUN网卡"),
+            dns_ok=c.get("fake-ip"),
+            probe_ok=c.get("echo出口"),
+            exit_ip=self.exit_ip,
+            in_whitelist=self.whitelist_hit,
+        )
 
     def icon_color(self) -> str:
         if self.drift:
@@ -62,30 +88,26 @@ class StateEvent:
         }[self.state]
 
     def tooltip(self) -> str:
-        line1 = "Claude Guard"
-        if self.paused:
-            line1 += "（已暂停）"
-        elif self.override_active:
-            line1 += "（临时放行中）"
-        line1 += f" - {self.state.value}"
-        if self.drift:
-            line1 += "｜漂移告警"
-        hit = "命中" if self.whitelist_hit else "未命中"
-        return f"{line1}\n出口 IP: {self.exit_ip}\n白名单: {hit}"
+        return tooltip_text(self._status())
 
     def detail_lines(self) -> list:
-        """状态详情四项检查文本。"""
-        lines = [
-            f"状态: {self.state.value}"
-            + ("（已暂停）" if self.paused else "")
-            + ("（临时放行中）" if self.override_active else ""),
-            f"出口 IP: {self.exit_ip}",
-            f"白名单命中: {'是' if self.whitelist_hit else '否'}",
-        ]
-        for name, result in self.checks.items():
-            lines.append(f"{name}: {result}")
+        """状态详情：第一行防火墙状态，拦截态第二行大白话原因，分隔线后技术细节。"""
+        s = self._status()
+        lines = [status_line(s)]
+        if s.blocking and not self.paused:
+            lines.append(reason_line(s))
         if self.drift:
-            lines.append("⚠ 检测到 IP 段漂移，请更新 blocked_cidrs")
+            lines.append(DRIFT_HINT)
+        lines.append("")
+        lines.append(TECH_SEPARATOR)
+        lines.append(f"状态: {self.state.value}"
+                     + ("（已暂停）" if self.paused else "")
+                     + ("（临时放行中）" if self.override_active else ""))
+        lines.append(f"出口 IP: {self.exit_ip}")
+        lines.append(f"白名单命中: {'是' if self.whitelist_hit else '否'}")
+        for name, result in self.checks.items():
+            shown = {True: "通过", False: "失败"}.get(result, "未探测")
+            lines.append(f"{name}: {shown}")
         return lines
 
 

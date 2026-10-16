@@ -114,7 +114,7 @@ def test_matrix_08_drift_only_sets_flag():
     t = sm.transition(mk_gate(sm.ALLOWED), sm.DRIFT_DETECTED)
     assert t.new_state.state == sm.ALLOWED
     assert t.new_state.drift_alarm
-    assert t.actions == [{"action": sm.NOTIFY_ALERT, "message": "漂移告警：封禁段覆盖可能失效"}]
+    assert t.actions == [{"action": sm.NOTIFY_ALERT, "message": "IP 段漂移告警"}]
     assert sm.ENABLE_FIREWALL not in acts(t)
     assert sm.DISABLE_FIREWALL not in acts(t)
     # also in BLOCKED: no firewall action

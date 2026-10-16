@@ -24,15 +24,15 @@ def main() -> None:
     seq = [
         StateEvent(state=State.ALLOWED, exit_ip="203.0.113.10",
                    whitelist_hit=True,
-                   checks={"mihomo 进程": "运行中", "TUN 网卡": "存在",
-                           "fake-ip": "生效", "echo 出口": "可达"}),
+                   checks={"mihomo进程": True, "TUN网卡": True,
+                           "fake-ip": True, "echo出口": True}),
         StateEvent(state=State.BLOCKED, exit_ip="未知", whitelist_hit=False,
-                   checks={"mihomo 进程": "已消失", "TUN 网卡": "不存在",
-                           "fake-ip": "未探测", "echo 出口": "未探测"}),
+                   checks={"mihomo进程": False, "TUN网卡": False,
+                           "fake-ip": None, "echo出口": None}),
         StateEvent(state=State.ALLOWED, exit_ip="1.2.3.4", whitelist_hit=False,
                    drift=True,
-                   checks={"mihomo 进程": "运行中", "TUN 网卡": "存在",
-                           "fake-ip": "生效", "echo 出口": "可达"}),
+                   checks={"mihomo进程": True, "TUN网卡": True,
+                           "fake-ip": True, "echo出口": True}),
     ]
     for evt in seq:
         t.push_event(evt)

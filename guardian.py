@@ -30,6 +30,7 @@ import time
 from pathlib import Path
 
 from core import checks as core_checks
+from core import messages
 from core import policy
 from core import statemachine as sm
 from core.config import Config, ConfigError, load as load_config
@@ -203,8 +204,8 @@ class Guardian:
         if not fast_ok:
             event = sm.FAST_FAIL
             self._last_checks = {
-                "mihomo进程": "失败", "TUN网卡": "失败",
-                "fake-ip": "未探测", "echo出口": "未探测",
+                "mihomo进程": False, "TUN网卡": False,
+                "fake-ip": None, "echo出口": None,
             }
         elif self._tick_count % self._slow_every == 0:
             # ⑥ 慢路径：echo 出口 IP 三分法 + fake-ip 生效
@@ -239,10 +240,10 @@ class Guardian:
                                  list(self.config.whitelist))
         self._last_echo_ip = echo.ip if echo.ok else self._last_echo_ip
         self._last_checks = {
-            "mihomo进程": "通过" if local.mihomo_running else "失败",
-            "TUN网卡": "通过" if local.tun_present else "失败",
-            "fake-ip": "通过" if fakeip_ok else "失败",
-            "echo出口": (echo.ip or "不可达") + ("" if echo.ok else "（探测失败）"),
+            "mihomo进程": bool(local.mihomo_running),
+            "TUN网卡": bool(local.tun_present),
+            "fake-ip": bool(fakeip_ok),
+            "echo出口": bool(echo.ok),
         }
         self.log.info("慢路径：echo=%s fakeip=%s verdict=%s",
                       echo.ip if echo.ok else f"不可达({echo.error})", fakeip_ok, verdict)
@@ -302,9 +303,32 @@ class Guardian:
             elif act == sm.DISABLE_FIREWALL:
                 self._fw_tolerant("disable")
             elif act in (sm.NOTIFY_BLOCK, sm.NOTIFY_ALLOW, sm.NOTIFY_ALERT):
-                self._notify("Claude Guard", a.get("message", ""))
+                title, body = self._toast_text(act)
+                self._notify(title, body)
             else:  # pragma: no cover - 状态机之外的指令
                 self.log.warning("未知 action: %r", a)
+
+    def _toast_text(self, act: str) -> tuple[str, str]:
+        """状态切换 Toast 文案，统一从 core.messages 取（用户可见面）。"""
+        if act == sm.NOTIFY_ALLOW:
+            return messages.toast_allow()
+        if act == sm.NOTIFY_ALERT:
+            return messages.toast_drift()
+        # NOTIFY_BLOCK：拦截态附大白话原因。
+        # 排除法：快/慢检查里 proxy/tunnel/dns 任一失败即按该项解释；
+        # 否则若看到了出口 IP，说明 CHECK_FAIL 由“出口不在白名单”触发。
+        local = self._last_checks
+        seen_ip = self._last_echo_ip is not None
+        s = messages.Status(
+            blocking=True,
+            proxy_ok=local.get("mihomo进程"),
+            tunnel_ok=local.get("TUN网卡"),
+            dns_ok=local.get("fake-ip"),
+            probe_ok=False if local.get("echo出口") is False else (None if not seen_ip else True),
+            exit_ip=self._last_echo_ip,
+            in_whitelist=False if seen_ip else None,
+        )
+        return messages.toast_block(s)
 
     # ------------------------------------------------------------------ 防火墙容错
 
@@ -579,47 +603,83 @@ def selfcheck(config: Config, logger: logging.Logger | None = None) -> int:
     """--check 自检模式：跑一轮快慢检查并打印结果后退出。
 
     不启动托盘、不修改防火墙（不发 enable/disable/ensure）。
+    输出格式：主结论（防火墙状态 + 大白话原因）在最上面，
+    技术细节放在分隔线之后供排障（文案统一来自 core.messages）。
     """
     log = logger or logging.getLogger(_LOGGER_NAME)
     if not log.handlers:
         logging.basicConfig(level=logging.INFO, format="%(message)s")
-    print("=== Claude Guard 自检（只读，不改防火墙） ===")
 
-    results: dict[str, str] = {}
+    results: dict[str, bool | None] = {}
+    exit_ip: str | None = None
+    in_whitelist: bool | None = None
+    echo_ok: bool | None = None
+
     # ① mihomo 进程
     try:
         mihomo = netprobe.check_mihomo_process(config.mihomo_process)
     except Exception as exc:
-        mihomo, _err = False, str(exc)
-        print(f"[warn] mihomo 检查异常: {exc}")
-    results["mihomo进程"] = "通过" if mihomo else "失败"
-    print(f"① mihomo 进程 ({config.mihomo_process}): {'存活' if mihomo else '未运行'}")
+        mihomo = False
+        log.info("[warn] mihomo 检查异常: %s", exc)
+    results["mihomo进程"] = mihomo
 
     # ② TUN 网卡
     tun_ok, tun_name = netprobe.check_tun_adapter(
         config.tun_adapter_keywords, config.fakeip_range)
-    results["TUN网卡"] = "通过" if tun_ok else "失败"
-    print(f"② TUN 网卡: {'存在' if tun_ok else '不存在'}"
-          + (f"（{tun_name}）" if tun_ok and tun_name else ""))
+    results["TUN网卡"] = tun_ok
 
     # ③ fake-ip 生效
     fk = dnscheck.check_fakeip(config.claude_domains[0], config.fakeip_range)
-    results["fake-ip"] = "通过" if (fk.ok and fk.in_fakeip_range) else "失败"
-    print(f"③ fake-ip 生效 ({config.claude_domains[0]}): "
-          f"{'是' if fk.ok and fk.in_fakeip_range else '否'} ips={fk.resolved_ips}"
-          + (f" error={fk.error}" if fk.error else ""))
+    fk_ok = bool(fk.ok and fk.in_fakeip_range)
+    results["fake-ip"] = fk_ok
 
     # ④ echo 出口 IP + 白名单三分法
     echo = netprobe.probe_echo_endpoints(list(config.echo_endpoints))
+    echo_ok = echo.ok
+    results["echo出口"] = echo_ok
     if echo.ok:
-        verdict = policy.classify(echo.ip, list(config.whitelist))
-        results["echo出口"] = echo.ip
-        print(f"④ echo 出口 IP: {echo.ip}（{echo.endpoint}）→ 白名单判定: {verdict}")
-    else:
-        results["echo出口"] = "不可达"
-        print(f"④ echo 出口 IP: 不可达（{echo.error}）")
+        exit_ip = echo.ip
+        in_whitelist = policy.classify(
+            echo.ip, list(config.whitelist)) == policy.CLEAN
 
     fast_ok = mihomo and tun_ok
+
+    # ---- 主结论（第一行防火墙状态 + 大白话原因）----
+    # 主结论看全量检查：echo 判定 DIRTY 也算“防火墙应当拦截”（排除法：
+    # 其余各项都正常时，不干净只能来自出口 IP 不在白名单）。
+    everything_else_ok = mihomo and tun_ok and fk_ok
+    should_block = not fast_ok or (
+        echo_ok is not None and in_whitelist is False and everything_else_ok
+    )
+    status = messages.Status(
+        blocking=should_block,
+        proxy_ok=mihomo,
+        tunnel_ok=tun_ok,
+        dns_ok=fk_ok,
+        probe_ok=echo_ok,
+        exit_ip=exit_ip,
+        in_whitelist=in_whitelist,
+    )
+    print(messages.status_line(status))
+    print(messages.reason_line(status))
+    if not should_block:
+        print("（自检为只读探测，不改变防火墙当前状态）")
+
+    # ---- 技术细节（排障用）----
+    print()
+    print(messages.TECH_SEPARATOR)
+    print(f"① mihomo 进程 ({config.mihomo_process}): "
+          f"{'存活' if mihomo else '未运行'}")
+    print(f"② TUN 网卡: {'存在' if tun_ok else '不存在'}"
+          + (f"（{tun_name}）" if tun_ok and tun_name else ""))
+    print(f"③ fake-ip 生效 ({config.claude_domains[0]}): "
+          f"{'是' if fk_ok else '否'} ips={fk.resolved_ips}"
+          + (f" error={fk.error}" if fk.error else ""))
+    if echo.ok:
+        verdict = policy.classify(echo.ip, list(config.whitelist))
+        print(f"④ echo 出口 IP: {echo.ip}（{echo.endpoint}）→ 白名单判定: {verdict}")
+    else:
+        print(f"④ echo 出口 IP: 不可达（{echo.error}）")
     print(f"\n快路径判定: {'正常' if fast_ok else '失败（将立即阻断）'}")
     print(f"四项检查: {results}")
     return 0 if fast_ok else 1

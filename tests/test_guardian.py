@@ -535,6 +535,9 @@ class TestSelfcheck:
         cfg = make_config()
         rc = guardian.selfcheck(cfg)
         out = capsys.readouterr().out
+        # 主结论在第一行（防火墙状态），技术细节在分隔线之后
+        assert out.splitlines()[0].startswith(("🛡", "✅"))
+        assert "技术细节" in out
         assert "①" in out and "②" in out and "③" in out and "④" in out
         assert rc == 0
 
