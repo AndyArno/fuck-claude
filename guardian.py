@@ -1,0 +1,625 @@
+# -*- coding: utf-8 -*-
+"""Claude Guard 主循环（组装层）— docs/02-architecture.md §2.4。
+
+单线程轮转调度：
+- 主循环按 fast_tick_sec（默认 1s）轮转，每轮必查快路径（psutil 本地检查），
+  每 N = slow_tick_sec / fast_tick_sec 轮查一次慢路径（echo + fake-ip）。
+- 漂移监控（DoH / RIPE）为独立守护线程，只投递 DRIFT_DETECTED 事件，不动规则。
+- 每轮做规则自愈：CG-Global 实际状态与状态机期望不一致时纠正（防第三方重置）；
+  CG-V6 每轮 ensure_enabled_v6（永久封死，门禁无权放行）。
+- override：OVERRIDE_START 起 override_minutes 计时，期间不阻断但记录审计日志，
+  到期自动恢复检查（OVERRIDE_EXPIRE）。
+- PAUSE/RESUME：暂停守护但不动规则（保持阻断态，只停检查）。
+- QUIT：规则保持当前实际状态退出（fail-closed：阻断态退出即阻断）；
+  EXIT：恢复 Enabled 后退出（需求 T-6）。
+- config 热重载：定期 mtime 检查，白名单编辑后无需重启。
+
+本模块不依赖托盘库：托盘只通过 duck-typed 的 Tray 抽象（push_event /
+commands 队列）交互，可被 exe 入口（scripts/run_guardian.py）复用。
+
+所有 platform 依赖均可注入（fw / np / dns / ripe / notify_fn），供单测 mock。
+"""
+from __future__ import annotations
+
+import logging
+import logging.handlers
+import os
+import queue
+import threading
+import time
+from pathlib import Path
+
+from core import checks as core_checks
+from core import policy
+from core import statemachine as sm
+from core.config import Config, ConfigError, load as load_config
+
+# platform 层默认实现（测试时整体注入替身）
+from platform import dnscheck, firewall as fw_mod, netprobe, ripecheck
+
+_LOGGER_NAME = "claude-guard"
+
+# 内部事件队列里除状态机事件外还可放控制标记
+_STOP = "__stop__"
+
+
+def setup_logging(config: Config, logger: logging.Logger | None = None) -> logging.Logger:
+    """按天滚动日志：logs/guard-YYYYMMDD.log，保留 log_retention_days 天。"""
+    log = logger or logging.getLogger(_LOGGER_NAME)
+    if log.handlers:  # 已初始化
+        return log
+    log.setLevel(logging.INFO)
+    log_dir = Path(config.log_dir or "logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    handler = logging.handlers.TimedRotatingFileHandler(
+        filename=str(log_dir / "guard.log"),
+        when="midnight",
+        backupCount=config.log_retention_days,
+        encoding="utf-8",
+    )
+    # 滚动文件名 guard-YYYYMMDD.log（需求 P-4 / 架构 §6）
+    handler.suffix = "%Y%m%d"
+    handler.namer = _guard_namer
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s [%(threadName)s] %(message)s"))
+    log.addHandler(handler)
+    return log
+
+
+def _guard_namer(default_name: str) -> str:
+    """guard.log.20261015 -> guard-20261015.log"""
+    base, _, stamp = default_name.rpartition(".")
+    return f"guard-{stamp}.log"
+
+
+def _default_notify(title: str, body: str) -> None:
+    from platform.notify import notify_state
+
+    notify_state(title, body)
+
+
+class Guardian:
+    """门禁主循环。单线程 tick；漂移线程只投事件。"""
+
+    def __init__(
+        self,
+        config: Config,
+        config_path: str | os.PathLike = "config.json",
+        *,
+        fw=None,
+        np=None,
+        dns=None,
+        ripe=None,
+        notify_fn=None,
+        tray=None,
+        clock=time.monotonic,
+        sleep_fn=time.sleep,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        self.config = config
+        self.config_path = str(config_path)
+        self.fw = fw or fw_mod
+        self.np = np or netprobe
+        self.dns = dns or dnscheck
+        self.ripe = ripe or ripecheck
+        self._notify = notify_fn or _default_notify
+        self.tray = tray
+        self._clock = clock
+        self._sleep = sleep_fn
+        self.log = logger or logging.getLogger(_LOGGER_NAME)
+
+        # 状态机状态（启动即阻断态，fail-closed）
+        self._gstate = sm.GateState(state=sm.BLOCKED)
+        self._counter = core_checks.CheckCounter(
+            config.pass_confirm_count, config.fail_unreachable_threshold
+        )
+        self.paused = False
+        self.override_until: float | None = None
+
+        self._tick_count = 0
+        self._slow_every = max(
+            1, round(config.slow_tick_sec / max(1, config.fast_tick_sec))
+        )
+        self._last_echo_ip: str | None = None
+        self._last_checks: dict[str, str] = {}
+        self._config_mtime: float | None = self._stat_mtime()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        # 漂移线程 → 主循环事件队列（也用于内部停止标记）
+        self._incoming: queue.Queue = queue.Queue()
+        self._drift_thread: threading.Thread | None = None
+        # 审计日志（override）
+        self._audit_path = Path(config.log_dir or "logs") / "override-audit.log"
+
+    # ------------------------------------------------------------------ 生命周期
+
+    def start(self) -> None:
+        """启动漂移监控线程 + 主循环线程；先预热防火墙子进程。"""
+        self._preheat()
+        self._drift_thread = threading.Thread(
+            target=self._drift_loop, name="drift-monitor", daemon=True
+        )
+        self._drift_thread.start()
+        self._thread = threading.Thread(target=self.run, name="guardian-main", daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout: float = 10.0) -> None:
+        self._stop.set()
+        self._incoming.put(_STOP)
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+        if self._drift_thread is not None:
+            self._drift_thread.join(timeout=2.0)
+
+    def run(self) -> None:
+        """主循环：每轮 tick + 睡 fast_tick；QUIT/EXIT 命令退出。"""
+        self.log.info("Guardian 启动：fast=%ds slow=%ds（每 %d 轮）",
+                      self.config.fast_tick_sec, self.config.slow_tick_sec,
+                      self._slow_every)
+        while not self._stop.is_set():
+            try:
+                if self.tick() is False:
+                    break
+            except Exception:
+                self.log.exception("tick 异常（继续运行，fail-closed）")
+            self._sleep(self.config.fast_tick_sec)
+        self.log.info("Guardian 主循环退出")
+
+    # ------------------------------------------------------------------ 单轮 tick
+
+    def tick(self) -> bool:
+        """执行一轮；返回 False 表示收到退出命令。"""
+        self._tick_count += 1
+
+        # ① 托盘命令（非阻塞 drain）
+        if self._drain_commands() is False:
+            return False
+
+        # ② config 热重载（mtime 变化则重载白名单等）
+        self._maybe_reload_config()
+
+        # ③ 漂移线程投递的事件
+        self._drain_incoming()
+
+        if self.paused:
+            # 暂停守护：不检查、不动规则，保持阻断态不变
+            self._push_tray()
+            return True
+
+        # ④ override 到期
+        if self._gstate.on_override and self.override_until is not None \
+                and self._clock() >= self.override_until:
+            self._log_audit("end")
+            self.log.info("Override 到期，恢复检查")
+            self.override_until = None
+            self._counter.reset()
+            self._apply_event(sm.OVERRIDE_EXPIRE)
+
+        # ⑤ 快路径：mihomo 进程 + TUN 网卡（纯本地，<1ms）
+        event: str | None = None
+        local = self._safe_local_env()
+        fast_ok = local.mihomo_running and local.tun_present
+        if not fast_ok:
+            event = sm.FAST_FAIL
+            self._last_checks = {
+                "mihomo进程": "失败", "TUN网卡": "失败",
+                "fake-ip": "未探测", "echo出口": "未探测",
+            }
+        elif self._tick_count % self._slow_every == 0:
+            # ⑥ 慢路径：echo 出口 IP 三分法 + fake-ip 生效
+            event = self._slow_path(local)
+
+        # ⑦ 转移 + 副作用
+        if event is not None:
+            self._apply_event(event)
+
+        # ⑧ 规则自愈（每轮）：CG-Global 与期望一致 + CG-V6 永久封死
+        self._self_heal_rules()
+
+        # ⑨ 通知 UI
+        self._push_tray()
+        return True
+
+    # ------------------------------------------------------------------ 检查路径
+
+    def _safe_local_env(self):
+        try:
+            return self.np.check_local_env(self.config)
+        except Exception as exc:
+            self.log.warning("本地环境检查失败：%s", exc)
+            return netprobe.LocalEnvResult(
+                mihomo_running=False, tun_present=False, error=str(exc))
+
+    def _slow_path(self, local) -> str | None:
+        """慢路径一轮，返回状态机事件或 None（无事件）。"""
+        fakeip_ok = self._check_fakeip()
+        echo = self._probe_echo()
+        verdict = policy.classify(echo.ip if echo.ok else None,
+                                 list(self.config.whitelist))
+        self._last_echo_ip = echo.ip if echo.ok else self._last_echo_ip
+        self._last_checks = {
+            "mihomo进程": "通过" if local.mihomo_running else "失败",
+            "TUN网卡": "通过" if local.tun_present else "失败",
+            "fake-ip": "通过" if fakeip_ok else "失败",
+            "echo出口": (echo.ip or "不可达") + ("" if echo.ok else "（探测失败）"),
+        }
+        self.log.info("慢路径：echo=%s fakeip=%s verdict=%s",
+                      echo.ip if echo.ok else f"不可达({echo.error})", fakeip_ok, verdict)
+
+        result = core_checks.evaluate(
+            {
+                "mihomo_alive": local.mihomo_running,
+                "tun_present": local.tun_present,
+                "fakeip_ok": fakeip_ok,
+            },
+            verdict,
+            self._counter,
+        )
+        if result == "BLOCK_NOW":
+            return sm.CHECK_FAIL
+        if result == "PASS_CONFIRMED":
+            return sm.CHECK_PASS
+        # HOLD：不可达时按 counter 升级语义保留 UNREACHABLE 事件；其余无事件
+        if verdict == policy.UNREACHABLE:
+            return sm.PROBE_UNREACHABLE
+        return None
+
+    def _check_fakeip(self) -> bool:
+        try:
+            result = self.dns.check_fakeip(
+                self.config.claude_domains[0], self.config.fakeip_range)
+            return result.ok and result.in_fakeip_range
+        except Exception as exc:
+            self.log.warning("fake-ip 检查失败：%s", exc)
+            return False
+
+    def _probe_echo(self):
+        try:
+            return self.np.probe_echo_endpoints(list(self.config.echo_endpoints))
+        except Exception as exc:
+            self.log.warning("echo 探测异常：%s", exc)
+            return netprobe.EchoResult(ok=False, ip=None, endpoint=None, error=str(exc))
+
+    # ------------------------------------------------------------------ 状态机
+
+    def _apply_event(self, event: str) -> None:
+        old = self._gstate
+        tr = sm.transition(self._gstate, event)
+        self._gstate = tr.new_state
+        if tr.actions:
+            self._execute(tr.actions)
+        if old != self._gstate or tr.actions:
+            self.log.info("状态转移 %s --%s--> %s actions=%s",
+                          old.state, event, self._gstate.state,
+                          [a["action"] for a in tr.actions])
+
+    def _execute(self, actions: list[dict]) -> None:
+        for a in actions:
+            act = a.get("action")
+            if act == sm.ENABLE_FIREWALL:
+                self._fw_tolerant("enable")
+            elif act == sm.DISABLE_FIREWALL:
+                self._fw_tolerant("disable")
+            elif act in (sm.NOTIFY_BLOCK, sm.NOTIFY_ALLOW, sm.NOTIFY_ALERT):
+                self._notify("Claude Guard", a.get("message", ""))
+            else:  # pragma: no cover - 状态机之外的指令
+                self.log.warning("未知 action: %r", a)
+
+    # ------------------------------------------------------------------ 防火墙容错
+
+    def _fw_tolerant(self, method: str, retries: int = 3, delay: float = 0.5) -> bool:
+        """防火墙调用包裹重试/容错：PS 冷启动可达 13s（> firewall.py 10s 超时），
+        失败重试；永不向上抛（主循环必须继续，fail-closed 下次自愈再纠正）。"""
+        for attempt in range(1, retries + 1):
+            try:
+                getattr(self.fw, method)(self.config)
+                return True
+            except Exception as exc:
+                self.log.error("防火墙 %s 第 %d/%d 次失败：%s",
+                               method, attempt, retries, exc)
+                if attempt < retries:
+                    self._sleep(delay)
+        self.log.error("防火墙 %s 重试 %d 次均失败（下轮自愈再纠正）", method, retries)
+        return False
+
+    def _preheat(self) -> None:
+        """启动预热：触发一次 PowerShell 冷启动，避免首轮检查超时误判。"""
+        try:
+            self.fw.ensure_exists(self.config)
+            self.log.info("防火墙预热完成（CG-Global ensure_exists）")
+        except Exception as exc:
+            self.log.error("防火墙预热失败（将继续，由自愈兜底）：%s", exc)
+        try:
+            self.fw.ensure_enabled_v6(self.config)
+        except Exception as exc:
+            self.log.error("CG-V6 预热失败：%s", exc)
+
+    def _self_heal_rules(self) -> None:
+        """每轮校验 CG-Global 实际状态与状态机期望一致；CG-V6 每轮 ensure。"""
+        expected_enabled = not (
+            self._gstate.state == sm.ALLOWED or self._gstate.on_override
+        )
+        try:
+            actual = bool(self.fw.get_status(self.config))
+        except Exception as exc:
+            self.log.warning("读取 CG-Global 状态失败（跳过本轮自愈）：%s", exc)
+            actual = None
+        if actual is not None and actual != expected_enabled:
+            self.log.warning(
+                "CG-Global 实际状态 %s 与期望 %s 不符（可能被第三方重置），纠正中",
+                "Enabled" if actual else "Disabled",
+                "Enabled" if expected_enabled else "Disabled",
+            )
+            self._fw_tolerant("enable" if expected_enabled else "disable")
+        try:
+            self.fw.ensure_enabled_v6(self.config)
+        except Exception as exc:
+            self.log.warning("CG-V6 ensure 失败：%s", exc)
+
+    # ------------------------------------------------------------------ 托盘命令
+
+    def _drain_commands(self) -> bool:
+        """处理托盘命令队列；返回 False 表示退出。"""
+        if self.tray is None:
+            return True
+        while True:
+            try:
+                cmd = self.tray.commands.get_nowait()
+            except queue.Empty:
+                return True
+            value = cmd.value if hasattr(cmd, "value") else str(cmd)
+            if self.handle_command(value) is False:
+                return False
+
+    def handle_command(self, cmd: str) -> bool:
+        """处理一条菜单命令；返回 False 表示退出主循环。"""
+        cmd = str(cmd).strip().lower()
+        if cmd == "override_30min":
+            self._start_override()
+        elif cmd == "pause":
+            if not self.paused:
+                self.paused = True
+                self._counter.reset()
+                # 不动规则：保持阻断态不变，只停检查
+                self.log.info("守护已暂停（规则保持当前实际状态）")
+        elif cmd == "resume":
+            if self.paused:
+                self.paused = False
+                self._counter.reset()
+                self.log.info("守护已恢复")
+        elif cmd == "edit_whitelist":
+            self._open_whitelist_editor()
+        elif cmd == "show_details":
+            pass  # 详情气泡由托盘线程自己展示
+        elif cmd == "quit":
+            # fail-closed：规则保持当前实际状态退出（阻断态退出即阻断）
+            self.log.info("收到退出命令（规则保持当前实际状态）")
+            self._stop.set()
+            return False
+        elif cmd == "exit":
+            # 需求 T-6：恢复 Enabled（阻断）后退出
+            self.log.info("收到 EXIT 命令：恢复阻断后退出")
+            self._fw_tolerant("enable")
+            self._stop.set()
+            return False
+        else:
+            self.log.warning("未知命令：%r", cmd)
+        return True
+
+    def _start_override(self) -> None:
+        if self._gstate.on_override:
+            self.log.info("Override 已在进行中，忽略重复请求")
+            return
+        self._apply_event(sm.OVERRIDE_START)
+        self.override_until = self._clock() + self.config.override_minutes * 60
+        self._counter.reset()
+        self._log_audit(
+            f"start duration_min={self.config.override_minutes}")
+        self.log.info("Override 开始：%d 分钟（期间不阻断，审计已记录）",
+                      self.config.override_minutes)
+
+    def _log_audit(self, line: str) -> None:
+        try:
+            self._audit_path.parent.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+            with open(self._audit_path, "a", encoding="utf-8") as f:
+                f.write(f"{stamp} {line}\n")
+        except OSError as exc:
+            self.log.error("写 override 审计日志失败：%s", exc)
+
+    def _open_whitelist_editor(self) -> None:
+        try:
+            from tray import open_config  # 延迟导入：guardian 模块级不依赖托盘库
+
+            open_config(self.config_path)
+            self.log.info("已打开配置文件供编辑白名单：%s", self.config_path)
+        except Exception as exc:
+            self.log.error("打开配置文件失败：%s", exc)
+
+    # ------------------------------------------------------------------ 热重载
+
+    def _stat_mtime(self) -> float | None:
+        try:
+            return os.stat(self.config_path).st_mtime
+        except OSError:
+            return None
+
+    def _maybe_reload_config(self) -> None:
+        mtime = self._stat_mtime()
+        if mtime is None or mtime == self._config_mtime:
+            return
+        self._config_mtime = mtime
+        try:
+            new_cfg = load_config(self.config_path)
+        except ConfigError as exc:
+            self.log.error("配置热重载失败（保留旧配置）：%s", exc)
+            return
+        old = self.config
+        self.config = new_cfg
+        self._counter = core_checks.CheckCounter(
+            new_cfg.pass_confirm_count, new_cfg.fail_unreachable_threshold)
+        self._slow_every = max(
+            1, round(new_cfg.slow_tick_sec / max(1, new_cfg.fast_tick_sec)))
+        self._audit_path = Path(new_cfg.log_dir or "logs") / "override-audit.log"
+        # 白名单/封禁段已更新：漂移告警交给新配置重新判定
+        if self._gstate.drift_alarm:
+            self._gstate = sm.GateState(
+                self._gstate.state, False, self._gstate.on_override)
+        changed = []
+        if old.whitelist != new_cfg.whitelist:
+            changed.append(f"whitelist={new_cfg.whitelist}")
+        if old.blocked_cidrs_v4 != new_cfg.blocked_cidrs_v4:
+            changed.append(f"blocked_cidrs_v4={new_cfg.blocked_cidrs_v4}")
+        self.log.info("配置热重载完成 %s", "；".join(changed) or "（无字段变化）")
+
+    # ------------------------------------------------------------------ 漂移监控
+
+    def _drain_incoming(self) -> None:
+        while True:
+            try:
+                item = self._incoming.get_nowait()
+            except queue.Empty:
+                return
+            if item == _STOP:
+                return
+            if item == sm.DRIFT_DETECTED:
+                self._apply_event(sm.DRIFT_DETECTED)
+
+    def _drift_loop(self) -> None:
+        """独立守护线程：DoH 每 doh_check_interval_min、RIPE 每 ripe_check_interval_hours。
+        只产生 DRIFT_DETECTED 事件，绝不动规则（D-3）；失败不影响主循环（D-4）。"""
+        doh_every = self.config.doh_check_interval_min * 60
+        ripe_every = self.config.ripe_check_interval_hours * 3600
+        next_doh = 0.0  # 启动即查一次
+        next_ripe = 0.0
+        while not self._stop.is_set():
+            now = time.time()
+            if now >= next_doh:
+                next_doh = now + doh_every
+                self._doh_drift_check()
+            if now >= next_ripe:
+                next_ripe = now + ripe_every
+                self._ripe_drift_check()
+            self._stop.wait(timeout=min(30.0, max(1.0, doh_every / 10)))
+
+    def _doh_drift_check(self) -> None:
+        try:
+            answers: list[str] = []
+            for domain in self.config.claude_domains:
+                r = self.dns.doh_resolve(domain)
+                if r.ok:
+                    answers.extend(r.addresses)
+                else:
+                    self.log.warning("DoH 解析 %s 失败（不影响门禁）：%s",
+                                     domain, r.error)
+            if not answers:
+                return
+            blocked = list(self.config.blocked_cidrs_v4) + list(self.config.blocked_cidrs_v6)
+            report = self._detect_drift(answers, [], blocked)
+            self._handle_drift_report("DoH", report)
+        except Exception as exc:
+            self.log.warning("DoH 漂移检查异常（不影响门禁）：%s", exc)
+
+    def _ripe_drift_check(self) -> None:
+        try:
+            r = self.ripe.fetch_announced_prefixes(self.config.asn)
+            if not r.ok:
+                self.log.warning("RIPE 查询失败（不影响门禁）：%s", r.error)
+                return
+            blocked = list(self.config.blocked_cidrs_v4) + list(self.config.blocked_cidrs_v6)
+            report = self._detect_drift([], list(r.prefixes), blocked)
+            self._handle_drift_report("RIPE", report)
+        except Exception as exc:
+            self.log.warning("RIPE 漂移检查异常（不影响门禁）：%s", exc)
+
+    def _detect_drift(self, dns_answers, ripe_prefixes, blocked_cidrs):
+        from core.drift import detect_drift
+
+        return detect_drift(dns_answers, ripe_prefixes, blocked_cidrs)
+
+    def _handle_drift_report(self, source: str, report) -> None:
+        if not report.drift_detected:
+            return
+        for line in report.details:
+            self.log.warning("漂移[%s] %s", source, line)
+        # 只投递事件，不动规则（D-3）
+        self._incoming.put(sm.DRIFT_DETECTED)
+
+    # ------------------------------------------------------------------ 托盘推送
+
+    def _push_tray(self) -> None:
+        if self.tray is None:
+            return
+        try:
+            from tray import State, StateEvent
+
+            state_map = {
+                sm.BLOCKED: State.BLOCKED,
+                sm.PROBING: State.PROBING,
+                sm.ALLOWED: State.ALLOWED,
+            }
+            evt = StateEvent(
+                state=state_map[self._gstate.state],
+                exit_ip=self._last_echo_ip or "未知",
+                whitelist_hit=bool(self._last_echo_ip),
+                checks=dict(self._last_checks),
+                paused=self.paused,
+                drift=self._gstate.drift_alarm,
+                override_active=self._gstate.on_override,
+            )
+            self.tray.push_event(evt)
+        except Exception as exc:
+            self.log.debug("托盘推送失败（不影响守护）：%s", exc)
+
+
+# ---------------------------------------------------------------------- 自检
+
+def selfcheck(config: Config, logger: logging.Logger | None = None) -> int:
+    """--check 自检模式：跑一轮快慢检查并打印结果后退出。
+
+    不启动托盘、不修改防火墙（不发 enable/disable/ensure）。
+    """
+    log = logger or logging.getLogger(_LOGGER_NAME)
+    if not log.handlers:
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
+    print("=== Claude Guard 自检（只读，不改防火墙） ===")
+
+    results: dict[str, str] = {}
+    # ① mihomo 进程
+    try:
+        mihomo = netprobe.check_mihomo_process(config.mihomo_process)
+    except Exception as exc:
+        mihomo, _err = False, str(exc)
+        print(f"[warn] mihomo 检查异常: {exc}")
+    results["mihomo进程"] = "通过" if mihomo else "失败"
+    print(f"① mihomo 进程 ({config.mihomo_process}): {'存活' if mihomo else '未运行'}")
+
+    # ② TUN 网卡
+    tun_ok, tun_name = netprobe.check_tun_adapter(
+        config.tun_adapter_keywords, config.fakeip_range)
+    results["TUN网卡"] = "通过" if tun_ok else "失败"
+    print(f"② TUN 网卡: {'存在' if tun_ok else '不存在'}"
+          + (f"（{tun_name}）" if tun_ok and tun_name else ""))
+
+    # ③ fake-ip 生效
+    fk = dnscheck.check_fakeip(config.claude_domains[0], config.fakeip_range)
+    results["fake-ip"] = "通过" if (fk.ok and fk.in_fakeip_range) else "失败"
+    print(f"③ fake-ip 生效 ({config.claude_domains[0]}): "
+          f"{'是' if fk.ok and fk.in_fakeip_range else '否'} ips={fk.resolved_ips}"
+          + (f" error={fk.error}" if fk.error else ""))
+
+    # ④ echo 出口 IP + 白名单三分法
+    echo = netprobe.probe_echo_endpoints(list(config.echo_endpoints))
+    if echo.ok:
+        verdict = policy.classify(echo.ip, list(config.whitelist))
+        results["echo出口"] = echo.ip
+        print(f"④ echo 出口 IP: {echo.ip}（{echo.endpoint}）→ 白名单判定: {verdict}")
+    else:
+        results["echo出口"] = "不可达"
+        print(f"④ echo 出口 IP: 不可达（{echo.error}）")
+
+    fast_ok = mihomo and tun_ok
+    print(f"\n快路径判定: {'正常' if fast_ok else '失败（将立即阻断）'}")
+    print(f"四项检查: {results}")
+    return 0 if fast_ok else 1
