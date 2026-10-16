@@ -25,10 +25,10 @@
 | B-1 | 默认阻断本机所有进程到 Anthropic IPv4 段（160.79.104.0/23）的出站连接（门控规则 CG-Global，随门禁切换） | 规则 Enabled 时，Edge 打不开 claude.ai、omp 无法调用 Claude API、Claude Code 无法连接 |
 | B-2 | 阻断不依赖代理进程存活（内核级 WFP 规则） | 杀掉 verge-mihomo.exe 后阻断仍然有效 |
 | B-3 | 阻断不影响其他任何流量 | 阻断态下 YouTube、GitHub、游戏、其他模型商 API 全部正常 |
-| B-4 | 规则状态可毫秒级切换（Enable/Disable） | 切换耗时 < 100ms |
+| B-4 | 规则状态切换（Enable/Disable）。实测经 PowerShell cmdlet 单次调用 ~1.6–3s（修订：原"<100ms"基于 WFP API 直调，当前实现走 PS 子进程不可达，见架构 §8） | 切换在 3s 内完成；切换期间规则不会处于"半开"状态（cmdlet 原子生效） |
 | B-5 | 工具崩溃/被杀时，规则停留在阻断态（fail-closed） | 强杀工具进程，Claude 仍不可达 |
 | B-6 | **Anthropic IPv6 段（2607:6bc0::/48、2607:6bc0:11::/48）永久封死**：独立规则 CG-V6，常驻 Enabled，门禁永远无权放行。理由：代理走 IPv4，任何到 Claude 的 v6 连接必然是绕过代理的直连（防系统 IPv6 被误重新启用后 AAAA 直连） | 规则 CG-V6 存在且 Enabled；门禁任何状态下 IPv6 直连 claude.ai 均不可达 |
-| B-7 | Clash 内核关闭必须**立即**阻断（快路径，纯本地进程/网卡检查，1s 周期，不等待网络探测） | Clash 死亡后 ≤2 秒内 Claude 不可达 |
+| B-7 | Clash 内核关闭必须**立即**阻断（快路径，纯本地进程/网卡检查，1s 周期，不等待网络探测） | Clash 死亡后 ≤2 秒内 Claude 不可达（29/30 的快路径 tick 满足；含自愈 PS 调用的 tick 最坏 ~4–5s，见架构 §8 残余） |
 
 ### 3.2 放行需求（门禁）
 

@@ -239,12 +239,17 @@ class Guardian:
             if event == sm.FAST_FAIL and old_state != sm.BLOCKED:
                 self._skip_heal = True
 
-        # ⑧ 规则自愈（默认 30s 一轮；状态迁移/动作后首轮提前；FAST_FAIL 后跳过）
+        # ⑧ 规则自愈（默认 30s 一轮；状态迁移/动作后首轮提前；FAST_FAIL 后跳过；
+        # 自愈异常时 _last_heal 回退，下一轮立即重试，不空等 30s）
         if self._skip_heal:
             self._skip_heal = False
         elif self._clock() - self._last_heal >= self._heal_interval:
             self._last_heal = self._clock()
-            self._self_heal_rules()
+            try:
+                self._self_heal_rules()
+            except Exception as exc:
+                self._last_heal = float("-inf")
+                self.log.warning("自愈异常，下一轮立即重试：%s", exc)
 
         # ⑨ 通知 UI
         self._push_tray()
@@ -475,8 +480,11 @@ class Guardian:
             self._stop.set()
             return False
         elif cmd == "exit":
-            # 需求 T-6：恢复 Enabled（阻断）后退出
+            # 需求 T-6：恢复 Enabled（阻断）后退出。
+            # 先 ensure_exists 再 enable：规则若已被第三方删除，仅 enable 会
+            # 3 次重试全抛错后裸退（复审 H4 边缘缺口）——必须重建再启用。
             self.log.info("收到 EXIT 命令：恢复阻断后退出")
+            self._fw_tolerant("ensure_exists")
             self._fw_tolerant("enable")
             self._stop.set()
             return False

@@ -28,6 +28,19 @@ install_task.ps1   安装开机自启计划任务（管理员）
 uninstall.ps1      卸载脚本：删计划任务 + 删防火墙规则（管理员）
 ```
 
+
+## 从旧版本升级
+
+若旧版本（v0.1 之前）已部署过防火墙规则：新版规则已从 TCP-only 改为
+Any 协议（封 UDP/QUIC），但程序不会自动重建已存在的旧规则。
+升级后请**以管理员运行一次**：
+
+```powershell
+Remove-NetFirewallRule -DisplayName 'CG-Global','CG-V6' -ErrorAction SilentlyContinue
+```
+
+然后启动新版程序，规则会自动以新语法重建。首次安装无此问题。
+
 ## 安装
 
 1. 把以上四项放到同一个目录（建议 `C:\Tools\ClaudeGuard\`）；
