@@ -29,3 +29,6 @@ Thumbs.db
 
 # Local secrets / machine-specific overrides
 config.local.json
+
+# 真实配置含用户出口 IP，不入库（模板见 config.example.json）
+config.json
