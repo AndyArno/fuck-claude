@@ -71,13 +71,17 @@ def _ps_array(values: list[str]) -> str:
 
 
 def _run_ps(script: str) -> str:
-    """执行一段 PowerShell 脚本，返回 stdout。权限/超时错误有明确异常。"""
+    """执行一段 PowerShell 脚本，返回 stdout。权限/超时错误有明确异常。
+
+    CREATE_NO_WINDOW：GUI 进程（托盘 exe 无控制台）spawn 控制台子进程时
+    默认会闪出黑窗，干扰用户——必须抑制。"""
     cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", script]
     try:
         proc = subprocess.run(
             cmd,
             capture_output=True,
             timeout=_PS_TIMEOUT,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except subprocess.TimeoutExpired as exc:
         # 超时≠权限问题：PS 冷启动可能超过 10s（非管理员），也可能是系统
