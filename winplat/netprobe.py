@@ -12,7 +12,10 @@ from dataclasses import dataclass
 import psutil
 import requests
 
-ECHO_TIMEOUT_SEC = 5
+# B-7：慢路径 echo 探测运行在 tick 内（串行），端点不可达时超时直接决定
+# 慢轮耗时上限（2 端点 × timeout）。5s×2 曾把慢轮拖到 ~10s；3s×2=6s 上限
+# 同时保证正常端点（<1s）不受影响。DIRTY 判定仍基于本轮最新探测结果。
+ECHO_TIMEOUT_SEC = 3
 
 # 主端点：Cloudflare trace 文本
 TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"

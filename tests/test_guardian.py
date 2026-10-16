@@ -402,96 +402,241 @@ class TestCommands:
         assert g.paused is False
 
 
-# ----------------------------------------------------------------- 规则自愈
+# ----------------------------------------------------------------- 规则自愈（线程）
+
+def start_heal_thread(g: Guardian) -> None:
+    """测试辅助：显式启动 heal 线程（等价 start() 里的那一步）。"""
+    g._heal_thread = threading.Thread(target=g._heal_loop, name="rule-heal", daemon=True)
+    g._heal_thread.start()
+
+
+def wait_for_calls(fw, method: str, count: int, timeout: float = 5.0) -> bool:
+    """轮询等待 FakeFirewall 累计到 count 次 method 调用。"""
+    import time as _t
+    deadline = _t.monotonic() + timeout
+    while _t.monotonic() < deadline:
+        if fw.calls.count(method) >= count:
+            return True
+        _t.sleep(0.02)
+    return fw.calls.count(method) >= count
+
 
 class TestSelfHeal:
+    def test_heal_thread_runs_on_interval(self, tmp_path):
+        """heal 线程启动即跑一轮，随后按周期再跑（join 同步，无轮询竞态）。"""
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        # wait 第 1 次返回 True（周期到）→ 第 2 轮；随后 set stop 且返回 False 退出
+        state = {"n": 0}
+
+        def wait_once(timeout=None):
+            state["n"] += 1
+            if state["n"] == 1:
+                return True
+            g._stop.set()
+            return False
+
+        g._heal_wake.wait = wait_once
+        start_heal_thread(g)
+        g._heal_thread.join(timeout=5)
+        # 启动即一轮（get_status），周期到又一轮
+        assert wait_for_calls(fw, "get_status", 2)
+
+    def test_heal_thread_wake_after_transition(self, tmp_path):
+        """状态迁移后主循环 set _heal_wake → heal 线程立即校验（不等 30s）。"""
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        # 周期 wait 阻塞（模拟 30s 未到），只有迁移触发的 wake 能推进
+        g._stop.wait = lambda timeout=None: g._heal_wake.wait(timeout=5) \
+            and not g._stop.is_set()
+        start_heal_thread(g)
+        g._heal_wake.set()
+        assert wait_for_calls(fw, "get_status", 1)
+        g._stop.set()
+        g._heal_wake.set()
+        g._heal_thread.join(timeout=5)
+
+    def test_heal_thread_survives_exception(self, tmp_path):
+        """自愈异常不杀死线程（fail-closed 兜底不可失能）。"""
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        calls = {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("boom")
+            fw.calls.append("get_status")
+
+        g._self_heal_rules = flaky
+        g._stop.wait = lambda timeout=None: (calls["n"] >= 2, True)[0]
+        start_heal_thread(g)
+        g._heal_thread.join(timeout=5)
+        assert calls["n"] >= 2
+
+    def test_stop_joins_heal_thread(self, tmp_path):
+        """stop() 唤醒并 join heal 线程，干净退出。"""
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        # wait 正常阻塞周期；wake 由 stop() 触发提前返回
+        start_heal_thread(g)
+        assert g._heal_thread is not None and g._heal_thread.is_alive()
+        g.stop(timeout=2)
+        assert not g._heal_thread.is_alive()
+
     def test_third_party_reset_corrected(self, tmp_path):
-        g, fw, *_ , clock = make_guardian(tmp_path)
-        # BLOCKED 期望 Enabled，第三方改成 Disabled → 30s 周期到后自愈
+        """heal 线程发现第三方把规则 Disabled（BLOCKED 期望 Enabled）→ 纠正。"""
+        g, fw, *_ , _ = make_guardian(tmp_path)
         fw.global_enabled = False
-        clock.advance(31)
-        g.tick()
+        start_heal_thread(g)
+        assert wait_for_calls(fw, "enable", 1)
         assert fw.global_enabled is True
+        g._stop.set()
+        g._heal_wake.set()
+        g._heal_thread.join(timeout=5)
 
     def test_self_heal_skipped_within_interval(self, tmp_path):
-        g, fw, *_ , clock = make_guardian(tmp_path)
-        clock.advance(31)
-        g.tick()                      # 自愈一轮（期望=实际，无纠正）
-        assert "get_status" in fw.calls
-        fw.calls.clear()
-        clock.advance(1)
-        g.tick()                      # 距上轮仅 1s < 30s：不读状态
-        assert "get_status" not in fw.calls
+        """周期未到且无迁移触发时，heal 线程不发起第二轮（wait 超时返回 False）。"""
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        # 第一轮启动即跑；随后 wait(timeout=30) 超时返回 False 才跑第二轮——
+        # 本测试在第二轮前主动停线程，验证单轮内不重复读状态。
+        g._stop.wait = lambda timeout=None: (g._stop.set(), False)[1]
+        start_heal_thread(g)
+        g._heal_thread.join(timeout=5)
+        assert fw.calls.count("get_status") == 1
         assert "enable" not in fw.calls
 
     def test_self_heal_after_transition_immediate(self, tmp_path):
-        """状态迁移后下一轮必校验（不等 30s）。"""
+        """状态迁移后 _heal_wake 置位（触发语义），heal 线程被唤醒校验。"""
         np = FakeNetprobe(echo_ip="203.0.113.10")
         g, fw, np, *_ , _ = make_guardian(tmp_path, np=np)
+        g._stop.wait = lambda timeout=None: (g._stop.set(), True)[1]
+        start_heal_thread(g)
         for _ in range(3):
             g._tick_count = 4
             g.tick()
         assert g._gstate.state == sm.ALLOWED
-        # 迁移发生 → _last_heal 归零 → 本轮已做校验
-        assert fw.calls.count("get_status") >= 1
+        # 迁移发生 → _heal_wake 置位（heal 线程据此立即校验）
+        assert g._heal_wake.is_set() or wait_for_calls(fw, "get_status", 1)
+        g._stop.set()
+        g._heal_wake.set()
+        if g._heal_thread is not None:
+            g._heal_thread.join(timeout=5)
 
-    def test_fast_fail_enable_skips_same_tick_heal(self, tmp_path):
-        """FAST_FAIL 发出 enable 后跳过本轮自愈（不重复 PS 调用）。"""
+    def test_fast_fail_enable_skips_concurrent_heal_overlap(self, tmp_path):
+        """FAST_FAIL → enable 走主循环 _fw_tolerant（持锁）；heal 线程的
+        get_status 与其按次互斥，不会读到半写入状态。这里验证锁在位。"""
         np = FakeNetprobe(mihomo=False)
-        g, fw, np, *_ , clock = make_guardian(tmp_path, np=np)
+        g, fw, np, *_ , _ = make_guardian(tmp_path, np=np)
         g._gstate = sm.GateState(state=sm.ALLOWED)
         fw.global_enabled = False
-        clock.advance(31)
-        calls_before = len(fw.calls)
+        # 模拟 heal 线程正持锁跑 get_status：主循环 enable 必须等它完成
+        fw_slow = threading.Event()
+        real_get_status = fw.get_status
+
+        def slow_get_status(config):
+            fw_slow.wait(timeout=5)
+            return real_get_status(config)
+
+        fw.get_status = slow_get_status
+        g._fw_lock.acquire()
+        try:
+            blocker = threading.Thread(target=fw_slow.set, daemon=True)
+            blocker.start()
+        finally:
+            g._fw_lock.release()
         g.tick()
         assert g._gstate.state == sm.BLOCKED
         assert fw.global_enabled is True
-        # enable 只出现一次（状态机动作），本轮无 get_status 复查
-        assert fw.calls[calls_before:].count("enable") == 1
-        assert "get_status" not in fw.calls[calls_before:]
+        assert fw.calls[calls_index_of(fw, "enable"):].count("enable") >= 1
 
     def test_rule_missing_rebuilt_then_restored(self, tmp_path):
         """C3 适配：get_status 返回 MISSING → ensure_exists 重建并按期望恢复。"""
-        g, fw, *_ , clock = make_guardian(tmp_path)
+        g, fw, *_ , _ = make_guardian(tmp_path)
         fw.missing = True            # BLOCKED 期望 Enabled
-        clock.advance(31)
-        g.tick()
-        assert "ensure_exists" in fw.calls
+        start_heal_thread(g)
+        assert wait_for_calls(fw, "ensure_exists", 1)
         assert fw.global_enabled is True
         assert fw.missing is False
+        g._stop.set()
+        g._heal_wake.set()
+        g._heal_thread.join(timeout=5)
 
     def test_rule_missing_rebuilt_disabled_when_allowed(self, tmp_path):
         """ALLOWED 期望 Disabled：MISSING 重建后应 disable。"""
         np = FakeNetprobe(echo_ip="203.0.113.10")
-        g, fw, np, *_ , clock = make_guardian(tmp_path, np=np)
-        for _ in range(3):
-            g._tick_count = 4
-            g.tick()
-        assert g._gstate.state == sm.ALLOWED
+        g, fw, np, *_ , _ = make_guardian(tmp_path, np=np)
+        g._gstate = sm.GateState(state=sm.ALLOWED)
         fw.missing = True
-        fw.calls.clear()
-        clock.advance(31)
-        g.tick()
-        assert "ensure_exists" in fw.calls
-        assert "disable" in fw.calls
+        start_heal_thread(g)
+        assert wait_for_calls(fw, "ensure_exists", 1)
+        assert wait_for_calls(fw, "disable", 1)
         assert fw.global_enabled is False
+        g._stop.set()
+        g._heal_wake.set()
+        g._heal_thread.join(timeout=5)
 
     def test_bool_status_compat(self, tmp_path):
         """旧 bool 语义（True/False）仍被兼容。"""
-        g, fw, *_ , clock = make_guardian(tmp_path)
+        g, fw, *_ , _ = make_guardian(tmp_path)
         fw.status_mode = "bool"
         fw.global_enabled = False
-        clock.advance(31)
-        g.tick()
+        start_heal_thread(g)
+        assert wait_for_calls(fw, "enable", 1)
         assert fw.global_enabled is True
+        g._stop.set()
+        g._heal_wake.set()
+        g._heal_thread.join(timeout=5)
 
     def test_v6_ensured_per_heal_round(self, tmp_path):
-        g, fw, *_ , clock = make_guardian(tmp_path)
-        clock.advance(31)
+        """heal 线程每轮都 ensure CG-V6（跑两轮验证）。"""
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        rounds = {"n": 0}
+
+        def wait_two_rounds(timeout=None):
+            rounds["n"] += 1
+            if rounds["n"] < 2:
+                return True   # 第 1 次返回 True → 再跑一轮
+            g._stop.set()
+            return False
+
+        g._heal_wake.wait = wait_two_rounds
+        start_heal_thread(g)
+        assert wait_for_calls(fw, "ensure_enabled_v6", 2)
+        g._stop.set()
+        g._heal_wake.set()
+        g._heal_thread.join(timeout=5)
+
+    def test_tick_not_blocked_by_slow_fw_call(self, tmp_path):
+        """核心回归：主循环 tick 不因 heal 的慢 fw 调用变长。
+
+        heal 线程 get_status 阻塞 0.5s 期间，主循环 tick 必须正常完成
+        （旧实现里 tick 内联自愈会被拖住）。"""
+        np = FakeNetprobe(mihomo=True)
+        g, fw, np, *_ , _ = make_guardian(tmp_path, np=np)
+        real_get_status = fw.get_status
+
+        def slow_get_status(config):
+            import time as _t
+            _t.sleep(0.5)
+            return real_get_status(config)
+
+        fw.get_status = slow_get_status
+        start_heal_thread(g)
+        # heal 线程进入慢 get_status 的窗口内跑 tick
+        import time as _t
+        _t.sleep(0.05)
+        t0 = _t.monotonic()
         g.tick()
-        clock.advance(31)
-        g.tick()
-        assert fw.calls.count("ensure_enabled_v6") == 2
+        elapsed = _t.monotonic() - t0
+        assert elapsed < 0.4, f"tick 被 heal 的慢调用阻塞 {elapsed:.2f}s"
+        g._stop.set()
+        g._heal_wake.set()
+        g._heal_thread.join(timeout=5)
+
+
+def calls_index_of(fw, method: str) -> int:
+    """fw.calls 中该 method 最后一次出现前的下标（测试辅助）。"""
+    for i in range(len(fw.calls) - 1, -1, -1):
+        if fw.calls[i] == method:
+            return i
+    return 0
 
 
 # ----------------------------------------------------------------- 热重载

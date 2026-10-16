@@ -81,7 +81,7 @@ def _default_notify(title: str, body: str) -> None:
 
 
 class Guardian:
-    """门禁主循环。单线程 tick；漂移线程只投事件。"""
+    """门禁主循环。单线程 tick；漂移线程只投事件；规则自愈在独立线程。"""
 
     def __init__(
         self,
@@ -118,11 +118,13 @@ class Guardian:
         self.paused = False
         self.override_until: float | None = None
 
-        # 规则自愈节奏（H1）：PS 子进程单次 ~1.6s，不能塞进每个快 tick。
-        # 30s 一轮 + 状态迁移后首轮必校验，兼顾 B-7 时序与自愈时效。
+        # 规则自愈（H1）：PS 子进程单次 ~1.6s，绝不能阻塞快路径 tick。
+        # 自愈跑在独立线程：30s 周期；主循环状态迁移/动作后通过 Event 唤醒
+        # 立即校验。_fw_lock 保证 heal 线程与主循环的防火墙调用不交错。
         self._heal_interval = 30.0
-        self._last_heal = 0.0
-        self._skip_heal = False
+        self._fw_lock = threading.Lock()
+        self._heal_wake = threading.Event()   # 主循环 → heal 线程：立即 heal
+        self._heal_thread: threading.Thread | None = None
 
         self._tick_count = 0
         self._slow_every = max(
@@ -142,20 +144,27 @@ class Guardian:
     # ------------------------------------------------------------------ 生命周期
 
     def start(self) -> None:
-        """启动漂移监控线程 + 主循环线程；先预热防火墙子进程。"""
+        """启动漂移/自愈线程 + 主循环线程；先预热防火墙子进程。"""
         self._preheat()
         self._drift_thread = threading.Thread(
             target=self._drift_loop, name="drift-monitor", daemon=True
         )
         self._drift_thread.start()
+        self._heal_thread = threading.Thread(
+            target=self._heal_loop, name="rule-heal", daemon=True
+        )
+        self._heal_thread.start()
         self._thread = threading.Thread(target=self.run, name="guardian-main", daemon=True)
         self._thread.start()
 
     def stop(self, timeout: float = 10.0) -> None:
         self._stop.set()
+        self._heal_wake.set()          # 唤醒 heal 线程令其检查退出标志
         self._incoming.put(_STOP)
         if self._thread is not None:
             self._thread.join(timeout=timeout)
+        if self._heal_thread is not None:
+            self._heal_thread.join(timeout=3.0)
         if self._drift_thread is not None:
             self._drift_thread.join(timeout=2.0)
 
@@ -202,7 +211,8 @@ class Guardian:
                 self._counter.reset()
                 self._apply_event(sm.OVERRIDE_EXPIRE)
             try:
-                self.fw.ensure_enabled_v6(self.config)
+                with self._fw_lock:
+                    self.fw.ensure_enabled_v6(self.config)
             except Exception as exc:
                 self.log.warning("暂停期间 CG-V6 ensure 失败：%s", exc)
             self._push_tray()
@@ -233,23 +243,12 @@ class Guardian:
 
         # ⑦ 转移 + 副作用
         if event is not None:
-            old_state = self._gstate.state
             self._apply_event(event)
-            # FAST_FAIL 发出 enable 后跳过本轮自愈（避免重复 PS 调用）
-            if event == sm.FAST_FAIL and old_state != sm.BLOCKED:
-                self._skip_heal = True
 
-        # ⑧ 规则自愈（默认 30s 一轮；状态迁移/动作后首轮提前；FAST_FAIL 后跳过；
-        # 自愈异常时 _last_heal 回退，下一轮立即重试，不空等 30s）
-        if self._skip_heal:
-            self._skip_heal = False
-        elif self._clock() - self._last_heal >= self._heal_interval:
-            self._last_heal = self._clock()
-            try:
-                self._self_heal_rules()
-            except Exception as exc:
-                self._last_heal = float("-inf")
-                self.log.warning("自愈异常，下一轮立即重试：%s", exc)
+        # ⑧ 规则自愈已移至独立后台线程（_heal_loop）：状态迁移/动作后由
+        # _apply_event/_execute 通过 _heal_wake 触发立即校验。主循环从此
+        # 不再被 PowerShell 子进程调用（~1.6s/次）阻塞，快路径检测间隔回到
+        # fast_tick 级别（B-7：杀 mihomo → FAST_FAIL 发现 ≤1s）。
 
         # ⑨ 通知 UI
         self._push_tray()
@@ -327,9 +326,12 @@ class Guardian:
             self.log.info("状态转移 %s --%s--> %s actions=%s",
                           old.state, event, self._gstate.state,
                           [a["action"] for a in tr.actions])
-        # 状态迁移或动作发出后，下一轮（含本轮稍后的自愈阶段）优先校验规则实际状态
+        # 状态迁移或动作发出后由 heal 线程立即校验规则实际状态（见下方 _heal_wake）
         if tr.actions or old != self._gstate:
-            self._last_heal = float("-inf")
+            # 状态迁移/动作后触发 heal 线程立即校验规则实际状态（不阻塞主循环）。
+            # 迁移点的 enable/disable 已是权威写入，本次校验是防线不是主路径；
+            # 若 heal 线程正在跑一轮，事件不排队、合并成"结束后尽早再跑一轮"。
+            self._heal_wake.set()
 
     def _execute(self, actions: list[dict]) -> None:
         for a in actions:
@@ -370,45 +372,68 @@ class Guardian:
 
     def _fw_tolerant(self, method: str, retries: int = 3, delay: float = 0.5) -> bool:
         """防火墙调用包裹重试/容错：PS 冷启动可达 13s（> firewall.py 10s 超时），
-        失败重试；永不向上抛（主循环必须继续，fail-closed 下次自愈再纠正）。"""
+        失败重试；永不向上抛（主循环必须继续，fail-closed 下次自愈再纠正）。
+        单次调用整体持 _fw_lock：与 heal 线程的调用按次互斥，规则读写不交错
+        （重试等待与子进程执行期间不持锁，锁粒度=一次 PS 调用）。"""
         for attempt in range(1, retries + 1):
-            try:
-                getattr(self.fw, method)(self.config)
-                return True
-            except Exception as exc:
-                self.log.error("防火墙 %s 第 %d/%d 次失败：%s",
-                               method, attempt, retries, exc)
-                if attempt < retries:
-                    self._sleep(delay)
+            with self._fw_lock:
+                try:
+                    getattr(self.fw, method)(self.config)
+                    return True
+                except Exception as exc:
+                    self.log.error("防火墙 %s 第 %d/%d 次失败：%s",
+                                   method, attempt, retries, exc)
+            if attempt < retries:
+                self._sleep(delay)
         self.log.error("防火墙 %s 重试 %d 次均失败（下轮自愈再纠正）", method, retries)
         return False
 
     def _preheat(self) -> None:
         """启动预热：触发一次 PowerShell 冷启动，避免首轮检查超时误判。"""
         try:
-            self.fw.ensure_exists(self.config)
+            with self._fw_lock:
+                self.fw.ensure_exists(self.config)
             self.log.info("防火墙预热完成（CG-Global ensure_exists）")
         except Exception as exc:
             self.log.error("防火墙预热失败（将继续，由自愈兜底）：%s", exc)
         try:
-            self.fw.ensure_enabled_v6(self.config)
+            with self._fw_lock:
+                self.fw.ensure_enabled_v6(self.config)
         except Exception as exc:
             self.log.error("CG-V6 预热失败：%s", exc)
+
+    # ------------------------------------------------------------------ 规则自愈（后台线程）
+
+    def _heal_loop(self) -> None:
+        """规则自愈线程：默认每 heal_interval 秒一轮；主循环状态迁移/动作后
+        通过 _heal_wake 唤醒立即校验。绝不让主循环等待 PowerShell。
+
+        自愈异常不杀死线程（fail-closed 依赖规则校验兜底）——1s 后立即重试，
+        等价旧实现 _last_heal=-inf 的"下轮重试"节奏。线程整体 try/except 续命。"""
+        while not self._stop.is_set():
+            delay = self._heal_interval
+            try:
+                self._self_heal_rules()
+            except Exception as exc:
+                self.log.warning("自愈异常，1s 后重试：%s", exc)
+                delay = 1.0
+            # 周期等待；主循环迁移触发 set _heal_wake → 提前唤醒立即校验
+            if self._heal_wake.wait(timeout=delay):
+                self._heal_wake.clear()
 
     def _self_heal_rules(self) -> None:
         """校验 CG-Global 实际状态与状态机期望一致；CG-V6 永久封死。
 
-        每轮都跑（PS 每次约 1.6s）会把 tick 拖到 4s+，违反 B-7 的 2s 阻断线，
-        因此移出快路径：默认每 heal_interval_sec=30s 一轮；状态迁移后首轮
-        必校验（迁移点 enable/disable 已是权威写入，无需立刻复查，但第三方
-        竞争窗口最短路径是迁移后尽早发现）。FAST_FAIL 分支发出 enable 后
-        跳过本轮（调用方置 _skip_heal）。
-        """
+        运行在独立 heal 线程（_heal_loop），不阻塞主循环快路径。所有
+        PowerShell 调用持 _fw_lock，与主循环的 enable/disable 按次互斥。
+        get_status / ensure_enabled_v6 为只读/幂等校验，裸调用后整体关闭，
+        保证读取与写入的规则状态一致。"""
         expected_enabled = not (
             self._gstate.state == sm.ALLOWED or self._gstate.on_override
         )
         try:
-            actual = self.fw.get_status(self.config)
+            with self._fw_lock:
+                actual = self.fw.get_status(self.config)
         except Exception as exc:
             self.log.warning("读取 CG-Global 状态失败（跳过本轮自愈）：%s", exc)
             return
@@ -431,7 +456,8 @@ class Guardian:
             )
             self._fw_tolerant("enable" if expected_enabled else "disable")
         try:
-            self.fw.ensure_enabled_v6(self.config)
+            with self._fw_lock:
+                self.fw.ensure_enabled_v6(self.config)
         except Exception as exc:
             self.log.warning("CG-V6 ensure 失败：%s", exc)
 
@@ -581,7 +607,8 @@ class Guardian:
             if self._fw_tolerant("create_rule_v6"):
                 # CG-V6 语义：永久 Enabled（B-6），重建后必须恢复
                 try:
-                    self.fw.ensure_enabled_v6(self.config)
+                    with self._fw_lock:
+                        self.fw.ensure_enabled_v6(self.config)
                 except Exception as exc:
                     self.log.warning("CG-V6 重建后恢复 Enabled 失败：%s", exc)
                 self.log.info("CG-V6 已按新 blocked_cidrs_v6 重建")
