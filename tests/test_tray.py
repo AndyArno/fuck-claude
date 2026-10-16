@@ -36,19 +36,65 @@ class TestDetailLines:
         assert "echo出口: 未探测" in lines
 
     def test_detail_lines_multiline_joined(self, monkeypatch):
-        """状态详情点菜单 → 弹真窗口（message_box_async），内容为全部行。"""
-        shown = []
-        import tray
-        monkeypatch.setattr(
-            tray, "message_box_async",
-            lambda title, text: shown.append((title, text)))
+        """状态详情（双击/菜单）→ LiveMessageBox 弹实时窗，内容为全部行。"""
+        boxes = []
+
+        class FakeBox:
+            def __init__(self, title, text):
+                self.title = title
+                self.text = text
+                self.refreshed = []
+                self.closed = False
+
+            def refresh(self, title, text):
+                self.refreshed.append((title, text))
+
+        import tray as _tray
+        monkeypatch.setattr(_tray, "LiveMessageBox", FakeBox)
         t = Tray()
         t._last_event = _event()
         t._show_details(None, None)
-        title, text = shown[0]
-        assert title == "Claude Guard 状态详情"
-        assert text == "\n".join(_event().detail_lines())
         assert t.commands.get_nowait() is Command.SHOW_DETAILS
+        box = t._detail_box
+        assert box.title == "Claude Guard 状态详情"
+        assert box.text == "\n".join(_event().detail_lines())
+
+    def test_detail_window_live_refresh(self, monkeypatch):
+        """实时刷新：详情窗开着时新事件到达 → refresh 被调，不重复弹窗。"""
+        boxes = []
+
+        class FakeBox:
+            def __init__(self, title, text):
+                self.title = title
+                self.text = text
+                self.refreshed = []
+                self.closed = False
+
+            def refresh(self, title, text):
+                self.refreshed.append(text)
+
+        import tray
+        monkeypatch.setattr(tray, "LiveMessageBox", FakeBox)
+        t = Tray()
+        t._last_event = _event()
+        t._show_details(None, None)
+        box = t._detail_box
+        assert box is not None
+        # 新事件（检查结果变化）→ 已开的窗被刷新
+        evt2 = StateEvent(
+            state=State.BLOCKED,
+            exit_ip="198.51.100.7",
+            checks={"mihomo进程": True, "TUN网卡": True,
+                    "fake-ip": True, "echo出口": True},
+        )
+        t._apply(evt2)
+        assert len(box.refreshed) == 1
+        assert "198.51.100.7" in box.refreshed[0]
+        # 窗开着时再双击 → 不弹第二个窗，仅刷新
+        t._last_event = evt2
+        t._show_details(None, None)
+        assert t._detail_box is box
+        assert len(box.refreshed) == 2
 
 
 class TestStartupConfirming:

@@ -18,7 +18,7 @@ import pystray
 from PIL import Image
 
 from winplat.assets import icon_file
-from winplat.winmsg import message_box_async
+from winplat.winmsg import LiveMessageBox
 from core.messages import (
     DRIFT_HINT,
     Status,
@@ -129,11 +129,15 @@ class Tray:
         self._icon: pystray.Icon = None  # type: ignore[assignment]
         self._stop_done = threading.Event()
         self._last_event: StateEvent | None = None
+        # 详情弹窗（LiveMessageBox）：开着期间随事件实时刷新正文；
+        # None = 当前没有打开的详情窗
+        self._detail_box: "LiveMessageBox | None" = None
+        self._detail_lock = threading.Lock()
 
     # ---- guardian 侧接口 -------------------------------------------------
 
     def start(self) -> None:
-        self._icon = pystray.Icon(
+        self._icon = _DblClickIcon(
             "ClaudeGuard",
             icon=self._icons["yellow"],
             title="Claude Guard 启动中",
@@ -170,12 +174,19 @@ class Tray:
                 pass  # UI 更新失败不影响守护
 
     def _apply(self, evt: StateEvent) -> None:
-        color = evt.icon_color()
-        img = self._icons[color]
-        if self._icon.icon is not img:
-            self._icon.icon = img
-        self._icon.title = evt.tooltip()
+        if self._icon is not None:  # 测试环境未 run_detached 时跳过 UI 更新
+            color = evt.icon_color()
+            img = self._icons[color]
+            if self._icon.icon is not img:
+                self._icon.icon = img
+            self._icon.title = evt.tooltip()
         self._last_event = evt
+        # 详情窗开着期间实时刷新（状态变化/新检查结果立即反映）
+        with self._detail_lock:
+            if self._detail_box is not None and not self._detail_box.closed:
+                self._detail_box.refresh(
+                    "Claude Guard 状态详情",
+                    "\n".join(evt.detail_lines()))
 
     def _menu_cb(self, cmd: Command):
         def callback(icon, item):
@@ -199,17 +210,45 @@ class Tray:
         )
 
     def _show_details(self, icon, item) -> None:
-        """状态详情：投递命令，同时弹出真窗口展示最近一次事件的完整详情。
+        """状态详情（左键双击或菜单"状态详情"）：弹实时窗口。
 
-        MessageBoxW 在独立 daemon 线程弹出（线程内模态），托盘消息泵与
-        guardian 主循环均不受阻塞；窗口由用户点"确定"关闭。"""
+        LiveMessageBox 弹出后随每次托盘事件刷新正文（见 _apply）：
+        窗口开着期间出口 IP / 检查结果变化立即反映，直到用户点确定。
+        已有窗口打开时仅刷新（不重复弹窗）。"""
         self.commands.put(Command.SHOW_DETAILS)
         evt = self._last_event
-        if evt is not None:
-            message_box_async("Claude Guard 状态详情",
-                              "\n".join(evt.detail_lines()))
+        if evt is None:
+            return
+        with self._detail_lock:
+            if self._detail_box is not None and not self._detail_box.closed:
+                self._detail_box.refresh(
+                    "Claude Guard 状态详情",
+                    "\n".join(evt.detail_lines()))
+                return
+            self._detail_box = LiveMessageBox(
+                "Claude Guard 状态详情",
+                "\n".join(evt.detail_lines()))
 
 
 # os.startfile 编辑白名单属于业务副作用，由 guardian 执行 Command.EDIT_WHITELIST 时调用
+
+
+class _DblClickIcon(pystray.Icon):
+    """左键双击才触发的托盘图标（防单击误触）。
+
+    pystray/_win32 默认 WM_LBUTTONUP（单击）即激活默认菜单项。本类
+    重写 _on_notify：忽略 WM_LBUTTONUP（0x202），仅 WM_LBUTTONDBLCLK
+    （0x203）激活。Windows 双击序列 DOWN→UP→DBLCLK→UP 中的首个 UP
+    被忽略，故单击不再弹详情；右键菜单行为不变（基类处理）。
+    """
+
+    def _on_notify(self, wparam, lparam):
+        if lparam == 0x203:  # WM_LBUTTONDBLCLK
+            self()
+        elif self._menu_handle and lparam == 0x205:  # WM_RBUTTONUP
+            super()._on_notify(wparam, lparam)
+        # WM_LBUTTONUP（0x202）刻意不响应：防单击误触（用户实测反馈）
+
+
 def open_config(config_path: str) -> None:
     os.startfile(config_path)  # noqa: S606 - Windows 默认编辑器打开
