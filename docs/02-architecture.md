@@ -37,6 +37,8 @@
   CG-V6 (IPv6 永久封死, 常开)
     2607:6bc0::/48
     2607:6bc0:11::/48
+  CG-FakeIP (门控, 与 CG-Global 同步)
+    claude 域名当前解析到的 fake-ip (198.18.x.x)
 ```
 
 核心决策：**core 层不产生任何副作用**（不碰网络、不碰防火墙、不碰 UI），所有副作用收敛到 platform 薄层与 Tray。这使状态机可以纯函数式单测——这是全项目联调风险的主要对冲。
@@ -90,7 +92,7 @@ slow 每 5 轮查一次。单线程无竞态。
 
 | 模块 | 职责 | 实现 |
 |---|---|---|
-| `firewall.py` | **两条规则**：CG-Global（IPv4 门控，Enable/Disable 随状态机）+ CG-V6（IPv6 永久 Enabled，启动时 ensure_exists，此后每轮只校验不切换——门禁无权放行）；规则存在性校验、创建、状态读取 | `powershell -NoProfile -Command "..."` 子进程封装 NetSecurity cmdlet。**每次主循环校验规则实际状态**（防第三方安全软件重置） |
+| `firewall.py` | **三条规则**：CG-Global（IPv4 门控，Enable/Disable 随状态机）+ CG-V6（IPv6 永久 Enabled，启动时 ensure_exists，此后每轮只校验不切换——门禁无权放行）+ CG-FakeIP（门控，与 CG-Global 同步 Enable/Disable；RemoteAddress = claude_domains 当前解析到的 fake-ip 集合，慢路径每轮重采集、变化即重建）；规则存在性校验、创建、状态读取 | `powershell -NoProfile -Command "..."` 子进程封装 NetSecurity cmdlet。**每次主循环校验规则实际状态**（防第三方安全软件重置） |
 | `netprobe.py` | echo 探测（主备双端点）、mihomo 进程检测、TUN 网卡检测 | `requests`(echo)、`psutil`(进程/网卡) |
 | `dnscheck.py` | fake-ip 生效检测、DoH 解析 | fake-ip：`socket.getaddrinfo` 检查返回 198.18.x.x；DoH：`https://1.1.1.1/dns-query?name=X&type=A`（json） |
 | `ripecheck.py` | RIPE announced-prefixes 查询 | `https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS399358` |
@@ -113,7 +115,7 @@ while True:  # fast_tick 周期（默认 1s）
         results = collect_checks(platform)       #    echo + fake-ip（网络探测）
         verdict  = core.checks.evaluate(results) #    判定（纯）
     actions  = core.statemachine.transition(state, verdict)  # ③ 转移（纯）
-    execute(platform, actions)                   # ④ 执行副作用（仅 CG-Global 切换；CG-V6 只校验）
+    execute(platform, actions)                   # ④ 执行副作用（CG-Global/CG-FakeIP 门控切换；CG-V6 只校验）
     tray.push(state_summary)                     # ⑤ 通知 UI
     if pending_commands: handle(command)         # ⑥ 处理菜单命令
 ```
@@ -128,6 +130,7 @@ while True:  # fast_tick 周期（默认 1s）
   "blocked_cidrs_v6": ["2607:6bc0::/48", "2607:6bc0:11::/48"],
   "rule_name_v4": "CG-Global",
   "rule_name_v6": "CG-V6",
+  "rule_name_fakeip": "CG-FakeIP",
   "whitelist": ["203.0.113.10"],
   "echo_endpoints": [
     "https://www.cloudflare.com/cdn-cgi/trace",

@@ -45,6 +45,7 @@ class Config:
     blocked_cidrs_v6: list[str] = field(default_factory=list)
     rule_name_v4: str = ""
     rule_name_v6: str = ""
+    rule_name_fakeip: str = "CG-FakeIP"
     whitelist: list[str] = field(default_factory=list)
     echo_endpoints: list[str] = field(default_factory=list)
     fakeip_range: str = ""
@@ -139,6 +140,10 @@ def validate_config(data: Any) -> None:
                     ipaddress.ip_network(entry, strict=False)
                 except ValueError:
                     errors.append(f"字段 'dns_whitelist' 含非法 IP/CIDR: {entry!r}")
+    # 可选 rule_name_fakeip：给了就必须是非空字符串，缺省 "CG-FakeIP"
+    rnf = data.get("rule_name_fakeip")
+    if rnf is not None and (not isinstance(rnf, str) or not rnf.strip()):
+        errors.append(f"字段 'rule_name_fakeip' 必须是非空字符串（当前值: {rnf!r}）")
     # 可选 dns_probe_domain：给了就必须是非空字符串
     dpd = data.get("dns_probe_domain")
     if dpd is not None and (not isinstance(dpd, str) or not dpd.strip()):
@@ -175,7 +180,9 @@ def load(path: str | Path) -> Config:
             _FIELDS_INT_POSITIVE + _FIELDS_STR_NONEMPTY + _FIELDS_STR_LIST
         )}
     )
-    # 可选字段：dns_probe_domain 有默认值；dns_whitelist 缺省复用 whitelist
+    # 可选字段：有默认值者缺省补齐
+    object.__setattr__(cfg, "rule_name_fakeip",
+                       data.get("rule_name_fakeip", "CG-FakeIP"))
     object.__setattr__(cfg, "dns_probe_domain",
                        data.get("dns_probe_domain", "whoami.ds.akahelp.net"))
     object.__setattr__(cfg, "dns_whitelist",

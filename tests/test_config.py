@@ -162,3 +162,20 @@ def test_dns_whitelist_wrong_type(tmp_path):
     data = dict(VALID, dns_whitelist="203.0.113.10")
     with pytest.raises(cfg.ConfigError, match="dns_whitelist"):
         cfg.load(write_cfg(tmp_path, data))
+
+
+def test_rule_name_fakeip_default(tmp_path):
+    c = cfg.load(write_cfg(tmp_path, VALID))
+    assert c.rule_name_fakeip == "CG-FakeIP"
+
+
+def test_rule_name_fakeip_custom(tmp_path):
+    data = dict(VALID, rule_name_fakeip="My-FakeIP")
+    c = cfg.load(write_cfg(tmp_path, data))
+    assert c.rule_name_fakeip == "My-FakeIP"
+
+
+def test_rule_name_fakeip_empty_rejected(tmp_path):
+    data = dict(VALID, rule_name_fakeip="")
+    with pytest.raises(cfg.ConfigError, match="rule_name_fakeip"):
+        cfg.load(write_cfg(tmp_path, data))

@@ -129,3 +129,56 @@ class TestEnableVerifies:
         monkeypatch.setattr(fw, "_run_ps", lambda s: "")
         monkeypatch.setattr(fw, "get_status", lambda cfg: fw.STATUS_ENABLED)
         fw.enable(type("C", (), {"rule_name_v4": "T"})())
+
+
+class TestFakeipRuleScripts:
+    """CG-FakeIP：脚本构造（离线）——Any 协议 + 规则名 + 远端地址集。"""
+
+    def _cfg(self):
+        return type("C", (), {"rule_name_fakeip": "CG-FakeIP"})()
+
+    def test_create_script_no_protocol(self, monkeypatch):
+        captured = []
+        monkeypatch.setattr(fw, "_run_ps", lambda s: captured.append(s))
+        fw.create_rule_fakeip(self._cfg(), ["198.18.0.1", "198.18.0.2"])
+        s = captured[0]
+        assert "-Protocol" not in s
+        assert "New-NetFirewallRule" in s
+        assert "Outbound" in s
+        assert "198.18.0.1" in s and "198.18.0.2" in s
+
+    def test_create_uses_ps_array(self, monkeypatch):
+        captured = []
+        monkeypatch.setattr(fw, "_run_ps", lambda s: captured.append(s))
+        fw.create_rule_fakeip(self._cfg(), ["198.18.0.1"])
+        assert "@('198.18.0.1')" in captured[0]
+
+    def test_enable_verifies_status(self, monkeypatch):
+        monkeypatch.setattr(fw, "_run_ps", lambda s: "")
+        monkeypatch.setattr(fw, "get_status_fakeip",
+                            lambda cfg: fw.STATUS_MISSING)
+        try:
+            fw.enable_fakeip(self._cfg())
+        except fw.FirewallError:
+            pass
+        else:
+            raise AssertionError("enable on missing fakeip rule must raise")
+
+    def test_get_status_uses_rule_name(self, monkeypatch):
+        captured = []
+        monkeypatch.setattr(fw, "_run_ps", lambda s: captured.append(s) or "True")
+        assert fw.get_status_fakeip(self._cfg()) == fw.STATUS_ENABLED
+        assert "'CG-FakeIP'" in captured[0]
+
+    def test_ensure_exists_rebuilds_only_when_missing(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(fw, "_run_ps",
+                            lambda s: calls.append(s) or "REBUILD")
+        monkeypatch.setattr(fw, "create_rule_fakeip",
+                            lambda c, ips: calls.append(("create", ips)))
+        fw.ensure_exists_fakeip(self._cfg(), ["198.18.0.1"])
+        assert ("create", ["198.18.0.1"]) in calls
+        calls.clear()
+        monkeypatch.setattr(fw, "_run_ps", lambda s: calls.append(s) or "OK")
+        fw.ensure_exists_fakeip(self._cfg(), ["198.18.0.1"])
+        assert not any(c == ("create", ["198.18.0.1"]) for c in calls)

@@ -80,6 +80,37 @@ def _default_notify(title: str, body: str) -> None:
     notify_state(title, body)
 
 
+def collect_fakeips(config: Config, log: logging.Logger | None = None) -> tuple[str, ...]:
+    """解析 config.claude_domains 全部域名（getaddrinfo），只收落在
+    fakeip_range 内的地址，返回有序去重集合。解析失败/返回真实 IP 的地址
+    不入集（真实 IP 由 CG-Global 覆盖，不得重复塞入 CG-FakeIP）。"""
+    import ipaddress
+    import socket
+
+    log = log or logging.getLogger(_LOGGER_NAME)
+    try:
+        net = ipaddress.ip_network(config.fakeip_range)
+    except ValueError as exc:
+        log.warning("fakeip_range 非法，跳过 CG-FakeIP 采集：%s", exc)
+        return ()
+    found: list[str] = []
+    for domain in config.claude_domains:
+        try:
+            infos = socket.getaddrinfo(domain, None)
+        except OSError as exc:
+            log.warning("fake-ip 解析 %s 失败（跳过该域名）：%s", domain, exc)
+            continue
+        for info in infos:
+            addr = info[4][0]
+            try:
+                ip = ipaddress.ip_address(addr)
+            except ValueError:
+                continue
+            if ip.version == 4 and ip in net and str(ip) not in found:
+                found.append(str(ip))
+    return tuple(found)
+
+
 class Guardian:
     """门禁主循环。单线程 tick；漂移线程只投事件；规则自愈在独立线程。"""
 
@@ -133,6 +164,10 @@ class Guardian:
         self._last_echo_ip: str | None = None
         self._last_echo_in_whitelist: bool | None = None
         self._last_dns_ip: str | None = None
+        # CG-FakeIP：当前规则内的 fake-ip 集合（上次成功写入的内容）；
+        # None = 尚未采集过。采集失败（空集）时规则保持上次内容，无害
+        # （真实 IP 已由 CG-Global 覆盖）。
+        self._fakeip_rule_ips: tuple[str, ...] | None = None
         self._last_checks: dict[str, str] = {}
         self._config_mtime: float | None = self._stat_mtime()
         self._stop = threading.Event()
@@ -260,6 +295,31 @@ class Guardian:
         self._push_tray()
         return True
 
+    # ---------------------------------------------------------- CG-FakeIP
+
+    def _collect_fakeips(self) -> tuple[str, ...]:
+        """解析 config.claude_domains 全部域名，只收 fakeip_range 内的地址。"""
+        return collect_fakeips(self.config, self.log)
+
+    def _refresh_fakeip_rule(self) -> None:
+        """慢路径每轮调用：重解析 fake-ip 集合，变化时重建 CG-FakeIP。
+
+        fake-ip 映射会因 mihomo 重启/缓存淘汰变化（RemoteAddress 只在
+        create 时写入，必须重建规则）。采集为空（Clash 死了，getaddrinfo
+        返回真实 IP 或失败）→ 保持规则现状：真实 IP 已由 CG-Global 覆盖。"""
+        ips = self._collect_fakeips()
+        if ips == self._fakeip_rule_ips:
+            return
+        if not ips:
+            self.log.info("fake-ip 集合为空，CG-FakeIP 保持现状")
+            return
+        if self._fw_tolerant("create_rule_fakeip", list(ips)):
+            self._fakeip_rule_ips = ips
+            # create 后规则默认 Enabled；放行态下须恢复 Disabled
+            if self._gstate.state == sm.ALLOWED or self._gstate.on_override:
+                self._fw_tolerant("disable_fakeip")
+            self.log.info("CG-FakeIP 已更新（%d 个 fake-ip）", len(ips))
+
     # ------------------------------------------------------------------ 检查路径
 
     def _safe_local_env(self):
@@ -272,6 +332,12 @@ class Guardian:
 
     def _slow_path(self, local) -> str | None:
         """慢路径一轮，返回状态机事件或 None（无事件）。"""
+        # CG-FakeIP：每轮慢路径重解析 fake-ip 集合，变化即重建（不阻塞判定：
+        # 重建失败由 _fw_tolerant 容错，下轮自愈再纠正）。
+        try:
+            self._refresh_fakeip_rule()
+        except Exception as exc:
+            self.log.warning("CG-FakeIP 刷新失败（保持现状）：%s", exc)
         fakeip_ok = self._check_fakeip()
         echo = self._probe_echo()
         verdict_before = policy.classify(echo.ip if echo.ok else None,
@@ -380,8 +446,11 @@ class Guardian:
             act = a.get("action")
             if act == sm.ENABLE_FIREWALL:
                 self._fw_tolerant("enable")
+                # CG-FakeIP 与 CG-Global 同命运（门控规则，非永久规则）
+                self._fw_tolerant("enable_fakeip")
             elif act == sm.DISABLE_FIREWALL:
                 self._fw_tolerant("disable")
+                self._fw_tolerant("disable_fakeip")
             elif act in (sm.NOTIFY_BLOCK, sm.NOTIFY_ALLOW, sm.NOTIFY_ALERT):
                 title, body = self._toast_text(act)
                 self._notify(title, body)
@@ -423,15 +492,17 @@ class Guardian:
 
     # ------------------------------------------------------------------ 防火墙容错
 
-    def _fw_tolerant(self, method: str, retries: int = 3, delay: float = 0.5) -> bool:
+    def _fw_tolerant(self, method: str, *args, retries: int = 3,
+                     delay: float = 0.5, **kwargs) -> bool:
         """防火墙调用包裹重试/容错：PS 冷启动可达 13s（> firewall.py 10s 超时），
         失败重试；永不向上抛（主循环必须继续，fail-closed 下次自愈再纠正）。
+        额外位置/关键字参数透传目标方法（如 create_rule_fakeip 的 ips）。
         单次调用整体持 _fw_lock：与 heal 线程的调用按次互斥，规则读写不交错
         （重试等待与子进程执行期间不持锁，锁粒度=一次 PS 调用）。"""
         for attempt in range(1, retries + 1):
             with self._fw_lock:
                 try:
-                    getattr(self.fw, method)(self.config)
+                    getattr(self.fw, method)(self.config, *args, **kwargs)
                     return True
                 except Exception as exc:
                     self.log.error("防火墙 %s 第 %d/%d 次失败：%s",
@@ -454,6 +525,17 @@ class Guardian:
                 self.fw.ensure_enabled_v6(self.config)
         except Exception as exc:
             self.log.error("CG-V6 预热失败：%s", exc)
+        # CG-FakeIP 预热：采集初始 fake-ip 集合并创建规则。失败不阻断启动
+        # （慢路径每轮重试；真实 IP 由 CG-Global 覆盖）。
+        try:
+            ips = self._collect_fakeips()
+            if ips:
+                with self._fw_lock:
+                    self.fw.create_rule_fakeip(self.config, list(ips))
+                self._fakeip_rule_ips = ips
+                self.log.info("CG-FakeIP 预热完成（%d 个 fake-ip）", len(ips))
+        except Exception as exc:
+            self.log.error("CG-FakeIP 预热失败（将继续，由慢路径重试）：%s", exc)
 
     # ------------------------------------------------------------------ 规则自愈（后台线程）
 
@@ -508,11 +590,42 @@ class Guardian:
                 "Enabled" if expected_enabled else "Disabled",
             )
             self._fw_tolerant("enable" if expected_enabled else "disable")
+        self._heal_fakeip(expected_enabled)
         try:
             with self._fw_lock:
                 self.fw.ensure_enabled_v6(self.config)
         except Exception as exc:
             self.log.warning("CG-V6 ensure 失败：%s", exc)
+
+    def _heal_fakeip(self, expected_enabled: bool) -> None:
+        """CG-FakeIP 自愈：状态与期望不符则纠正；规则缺失且有已知集合则重建。
+        无已知集合（从未采集成功）时跳过——真实 IP 已由 CG-Global 覆盖。"""
+        try:
+            with self._fw_lock:
+                status = self.fw.get_status_fakeip(self.config)
+        except Exception as exc:
+            self.log.warning("读取 CG-FakeIP 状态失败（跳过本轮）：%s", exc)
+            return
+        status_str = str(status).upper()
+        if status_str == "MISSING":
+            if self._fakeip_rule_ips:
+                self.log.warning("CG-FakeIP 规则缺失，用已知集合重建中")
+                if self._fw_tolerant("ensure_exists_fakeip",
+                                     list(self._fakeip_rule_ips)):
+                    if not expected_enabled:
+                        self._fw_tolerant("disable_fakeip")
+            return
+        # 与 CG-Global 相同的兼容语义：三态字符串优先，否则按 bool（真值=Enabled）
+        actual_enabled = (status_str == "ENABLED" if status_str in
+                          ("ENABLED", "DISABLED") else bool(status))
+        if actual_enabled != expected_enabled:
+            self.log.warning(
+                "CG-FakeIP 实际状态 %s 与期望 %s 不符，纠正中",
+                "Enabled" if actual_enabled else "Disabled",
+                "Enabled" if expected_enabled else "Disabled",
+            )
+            self._fw_tolerant(
+                "enable_fakeip" if expected_enabled else "disable_fakeip")
 
     # ------------------------------------------------------------------ 托盘命令
 
@@ -541,6 +654,7 @@ class Guardian:
                 # 暂停语义 = 冻结在阻断态（fail-closed，安全优先）：
                 # 强制 enable 规则，即使暂停前处于放行态/override。
                 self._fw_tolerant("enable")
+                self._fw_tolerant("enable_fakeip")
                 self._gstate = sm.GateState(
                     sm.BLOCKED, self._gstate.drift_alarm, self._gstate.on_override)
                 self.log.info("守护已暂停（规则冻结在阻断态，不执行检查）")
@@ -565,6 +679,10 @@ class Guardian:
             self.log.info("收到 EXIT 命令：恢复阻断后退出")
             self._fw_tolerant("ensure_exists")
             self._fw_tolerant("enable")
+            if self._fakeip_rule_ips:
+                self._fw_tolerant("ensure_exists_fakeip",
+                                  list(self._fakeip_rule_ips))
+            self._fw_tolerant("enable_fakeip")
             self._stop.set()
             return False
         else:
@@ -634,16 +752,30 @@ class Guardian:
         changed = []
         v4_changed = old.blocked_cidrs_v4 != new_cfg.blocked_cidrs_v4
         v6_changed = old.blocked_cidrs_v6 != new_cfg.blocked_cidrs_v6
+        domains_changed = old.claude_domains != new_cfg.claude_domains
+        fakeip_range_changed = old.fakeip_range != new_cfg.fakeip_range
         if v4_changed:
             changed.append(f"blocked_cidrs_v4={new_cfg.blocked_cidrs_v4}")
         if v6_changed:
             changed.append(f"blocked_cidrs_v6={new_cfg.blocked_cidrs_v6}")
+        if domains_changed:
+            changed.append(f"claude_domains={new_cfg.claude_domains}")
+        if fakeip_range_changed:
+            changed.append(f"fakeip_range={new_cfg.fakeip_range}")
         if old.whitelist != new_cfg.whitelist:
             changed.append(f"whitelist={new_cfg.whitelist}")
         # 封禁段变化必须重建 WFP 规则（RemoteAddress 只在 create 时写入），
         # 否则日志“已更新”但规则仍封旧 CIDR（H5 断点）。
         if v4_changed or v6_changed:
             self._rebuild_blocked_rules(v4_changed, v6_changed)
+        # claude_domains / fakeip_range 变化：CG-FakeIP 内容随之失效，立即
+        # 按新配置重采集重建（放行态下重建为 Disabled，下轮迁移 enable 生效）。
+        if domains_changed or fakeip_range_changed:
+            self._fakeip_rule_ips = None  # 强制视为变化
+            try:
+                self._refresh_fakeip_rule()
+            except Exception as exc:
+                self.log.warning("CG-FakeIP 热重载重建失败（慢路径重试）：%s", exc)
         self.log.info("配置热重载完成 %s", "；".join(changed) or "（无字段变化）")
 
     def _rebuild_blocked_rules(self, v4: bool, v6: bool) -> None:
@@ -858,6 +990,15 @@ def selfcheck(config: Config, logger: logging.Logger | None = None) -> int:
     print(f"③ fake-ip 生效 ({config.claude_domains[0]}): "
           f"{'是' if fk_ok else '否'} ips={fk.resolved_ips}"
           + (f" error={fk.error}" if fk.error else ""))
+    # ③' CG-FakeIP：全域名 fake-ip 集合 + 规则状态（状态查询需管理员）
+    fakeips = collect_fakeips(config, log)
+    print(f"③' CG-FakeIP 集合 ({len(fakeips)} 个): "
+          f"{list(fakeips) or '空（Clash 未运行或返回真实 IP）'}")
+    try:
+        fw_status = fw_mod.get_status_fakeip(config)
+        print(f"    规则 {config.rule_name_fakeip}: {fw_status}")
+    except Exception as exc:
+        print(f"    规则 {config.rule_name_fakeip}: 查询失败（{exc}）")
     if echo.ok:
         verdict = policy.classify(echo.ip, list(config.whitelist))
         print(f"④ echo 出口 IP: {echo.ip}（{echo.endpoint}）→ 白名单判定: {verdict}")

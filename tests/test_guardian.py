@@ -34,6 +34,8 @@ class FakeFirewall:
         self.global_enabled = global_enabled
         self.status_mode = status_mode
         self.missing = missing
+        self.fakeip_enabled: bool | None = None  # None = 规则不存在
+        self.fakeip_ips: list[str] = []
         self.calls: list[str] = []
 
     def create_rule(self, config) -> None:
@@ -60,6 +62,36 @@ class FakeFirewall:
     def ensure_exists(self, config) -> None:
         self.calls.append("ensure_exists")
         self.missing = False
+
+    # -------- CG-FakeIP（门控规则：与 CG-Global 同步 enable/disable）
+
+    def create_rule_fakeip(self, config, ips) -> None:
+        self.calls.append("create_rule_fakeip")
+        self.fakeip_ips = list(ips)
+        self.fakeip_enabled = True
+
+    def enable_fakeip(self, config) -> None:
+        self.calls.append("enable_fakeip")
+        if self.fakeip_enabled is None:
+            raise RuntimeError("CG-FakeIP 规则不存在")
+        self.fakeip_enabled = True
+
+    def disable_fakeip(self, config) -> None:
+        self.calls.append("disable_fakeip")
+        if self.fakeip_enabled is None:
+            raise RuntimeError("CG-FakeIP 规则不存在")
+        self.fakeip_enabled = False
+
+    def get_status_fakeip(self, config):
+        self.calls.append("get_status_fakeip")
+        if self.fakeip_enabled is None:
+            return "MISSING"
+        return "ENABLED" if self.fakeip_enabled else "DISABLED"
+
+    def ensure_exists_fakeip(self, config, ips) -> None:
+        self.calls.append("ensure_exists_fakeip")
+        if self.fakeip_enabled is None:
+            self.create_rule_fakeip(config, ips)
 
     def create_rule_v6(self, config) -> None:
         self.calls.append("create_rule_v6")
@@ -1014,3 +1046,211 @@ class TestBlockedCheckFailIdempotent:
         assert toasts == []                      # 无重复通知
         # 无冗余 enable（自愈例外：周期性校验不算状态机动作）
         assert g._gstate.state == sm.BLOCKED
+
+
+# ----------------------------------------------------------------- CG-FakeIP
+
+class TestCollectFakeips:
+    def test_collects_only_fakeip_range_addresses(self):
+        import socket as s
+        cfg = make_config(claude_domains=["a.test", "b.test"])
+        infos = {
+            "a.test": [(2, 1, 6, "", ("198.18.0.1", 0)),
+                       (2, 1, 6, "", ("203.0.113.10", 0))],  # 真实 IP 不入集
+            "b.test": [(2, 1, 6, "", ("198.18.5.9", 0))],
+        }
+        real = s.getaddrinfo
+        s.getaddrinfo = lambda h, *a, **k: infos.get(h, [])
+        try:
+            assert guardian.collect_fakeips(cfg) == ("198.18.0.1", "198.18.5.9")
+        finally:
+            s.getaddrinfo = real
+
+    def test_resolve_failure_skips_domain(self):
+        import socket as s
+        cfg = make_config(claude_domains=["dead.test", "ok.test"])
+
+        def ga(host, *a, **k):
+            if host == "dead.test":
+                raise OSError("resolve failed")
+            return [(2, 1, 6, "", ("198.18.0.7", 0))]
+
+        real = s.getaddrinfo
+        s.getaddrinfo = ga
+        try:
+            assert guardian.collect_fakeips(cfg) == ("198.18.0.7",)
+        finally:
+            s.getaddrinfo = real
+
+    def test_bad_fakeip_range_returns_empty(self):
+        cfg = make_config(fakeip_range="not-a-range")
+        assert guardian.collect_fakeips(cfg) == ()
+
+
+class TestFakeipLifecycle:
+    def test_dirty_state_enables_fakeip(self, tmp_path):
+        """脏态迁移 → ENABLE_FIREWALL 同步 enable CG-FakeIP。"""
+        np = FakeNetprobe(echo_ip="198.51.100.99")  # 白名单外 → DIRTY
+        g, fw, *_ , _ = make_guardian(tmp_path, np=np)
+        g._gstate = sm.GateState(state=sm.ALLOWED)
+        fw.fakeip_enabled = False
+        g._tick_count = 4  # 触发慢路径
+        g.tick()
+        assert g._gstate.state == sm.BLOCKED
+        assert fw.fakeip_enabled is True
+        assert "enable_fakeip" in fw.calls
+
+    def test_allowed_state_disables_fakeip(self, tmp_path):
+        np = FakeNetprobe(echo_ip="203.0.113.10")  # 白名单内
+        g, fw, *_ , _ = make_guardian(tmp_path, np=np)
+        fw.fakeip_enabled = True
+        for _ in range(3):  # pass_confirm_count=3
+            g._tick_count = 4
+            g.tick()
+        assert g._gstate.state == sm.ALLOWED
+        assert "disable_fakeip" in fw.calls
+        assert fw.fakeip_enabled is False
+
+    def test_fakeip_set_change_rebuilds_rule(self, tmp_path):
+        """慢路径每轮重解析；集合变化 → create_rule_fakeip 重建。"""
+        import socket as s
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        g._gstate = sm.GateState(state=sm.BLOCKED)
+        fw.fakeip_enabled = True
+        current = {"ips": ["198.18.0.1"]}
+
+        def ga(host, *a, **k):
+            return [(2, 1, 6, "", (ip, 0)) for ip in current["ips"]]
+
+        real = s.getaddrinfo
+        s.getaddrinfo = ga
+        try:
+            g._tick_count = 4
+            g.tick()
+            assert fw.fakeip_ips == ["198.18.0.1"]
+            current["ips"] = ["198.18.0.2", "198.18.0.1"]
+            g._tick_count = 9
+            g.tick()
+            assert fw.fakeip_ips == ["198.18.0.2", "198.18.0.1"]
+            before = fw.calls.count("create_rule_fakeip")
+            g._tick_count = 14
+            g.tick()
+            assert fw.calls.count("create_rule_fakeip") == before
+        finally:
+            s.getaddrinfo = real
+
+    def test_empty_fakeip_set_keeps_rule(self, tmp_path):
+        """解析失败（空集）→ 规则保持现状，不被清空。"""
+        import socket as s
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        fw.fakeip_enabled = True
+        fw.fakeip_ips = ["198.18.0.1"]
+        g._fakeip_rule_ips = ("198.18.0.1",)
+
+        def boom(h, *a, **k):
+            raise OSError("boom")
+
+        real = s.getaddrinfo
+        s.getaddrinfo = boom
+        try:
+            g._tick_count = 4
+            g.tick()
+            assert fw.fakeip_ips == ["198.18.0.1"]
+            assert "create_rule_fakeip" not in fw.calls
+        finally:
+            s.getaddrinfo = real
+
+    def test_real_ips_not_written_to_rule(self, tmp_path):
+        """解析只返回真实 IP → 空集，不写入规则。"""
+        import socket as s
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        fw.fakeip_enabled = None  # 规则尚未建立
+        real = s.getaddrinfo
+        s.getaddrinfo = lambda h, *a, **k: [(2, 1, 6, "", ("203.0.113.10", 0))]
+        try:
+            g._tick_count = 4
+            g.tick()
+            assert "create_rule_fakeip" not in fw.calls
+            assert fw.fakeip_enabled is None
+        finally:
+            s.getaddrinfo = real
+
+    def test_fakeip_rebuild_in_allowed_state_restores_disabled(self, tmp_path):
+        """放行态下集合变化重建后须恢复 Disabled。"""
+        import socket as s
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        g._gstate = sm.GateState(state=sm.ALLOWED, on_override=False)
+        g._fakeip_rule_ips = ("198.18.0.1",)
+        fw.fakeip_enabled = False
+        fw.fakeip_ips = ["198.18.0.1"]
+        real = s.getaddrinfo
+        s.getaddrinfo = lambda h, *a, **k: [(2, 1, 6, "", ("198.18.0.9", 0))]
+        try:
+            g._refresh_fakeip_rule()
+            assert fw.fakeip_ips == ["198.18.0.9"]
+            assert fw.fakeip_enabled is False
+        finally:
+            s.getaddrinfo = real
+
+    def test_heal_corrects_fakeip_drift(self, tmp_path):
+        """自愈：CG-FakeIP 被第三方禁用（阻断态）→ 纠正回 Enabled。"""
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        g._gstate = sm.GateState(state=sm.BLOCKED)
+        fw.fakeip_enabled = False
+        fw.fakeip_ips = ["198.18.0.1"]
+        g._fakeip_rule_ips = ("198.18.0.1",)
+        g._self_heal_rules()
+        assert fw.fakeip_enabled is True
+
+    def test_heal_rebuilds_missing_fakeip(self, tmp_path):
+        """自愈：规则被删且放行态 → 用已知集合重建并 Disabled。"""
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        g._gstate = sm.GateState(state=sm.ALLOWED)
+        fw.fakeip_enabled = None
+        g._fakeip_rule_ips = ("198.18.0.1",)
+        g._self_heal_rules()
+        assert fw.fakeip_ips == ["198.18.0.1"]
+        assert fw.fakeip_enabled is False
+
+    def test_hot_reload_domain_change_rebuilds(self, tmp_path):
+        """热重载 claude_domains 变化 → CG-FakeIP 重建。"""
+        import json as _json
+        import socket as s
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(_json.dumps({
+            "blocked_cidrs_v4": ["203.0.113.0/24"],
+            "blocked_cidrs_v6": ["2001:db8::/48"],
+            "rule_name_v4": "CG-Global", "rule_name_v6": "CG-V6",
+            "whitelist": ["203.0.113.10"],
+            "echo_endpoints": ["https://echo.test/ip"],
+            "fakeip_range": "198.18.0.0/15",
+            "mihomo_process": "m.exe",
+            "tun_adapter_keywords": ["mihomo"],
+            "fast_tick_sec": 1, "slow_tick_sec": 5,
+            "pass_confirm_count": 3, "fail_unreachable_threshold": 5,
+            "doh_check_interval_min": 60, "ripe_check_interval_hours": 24,
+            "override_minutes": 30, "claude_domains": ["claude.ai"],
+            "asn": "AS399358", "log_dir": "logs",
+            "log_retention_days": 30,
+        }), encoding="utf-8")
+        data = _json.loads(cfg_path.read_text(encoding="utf-8"))
+        data["claude_domains"] = ["claude.ai", "api.anthropic.com"]
+        cfg_path.write_text(_json.dumps(data), encoding="utf-8")
+
+        calls = {"n": 0}
+
+        def ga(host, *a, **k):
+            calls["n"] += 1
+            return [(2, 1, 6, "", ("198.18.0.1", 0))]
+
+        real = s.getaddrinfo
+        s.getaddrinfo = ga
+        try:
+            g._config_mtime = None
+            g._maybe_reload_config()
+        finally:
+            s.getaddrinfo = real
+        assert g.config.claude_domains == ["claude.ai", "api.anthropic.com"]
+        assert calls["n"] >= 2
+        assert fw.fakeip_ips == ["198.18.0.1"]

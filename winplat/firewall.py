@@ -252,6 +252,63 @@ def get_status_v6(config: Config) -> RuleStatus:
     return _parse_get_status_output(out)
 
 
+# ---------------------------------------------------------------- CG-FakeIP
+
+def create_rule_fakeip(config: Config, ips) -> None:
+    """创建（或覆盖重建）CG-FakeIP 规则，阻断 claude_domains 当前解析到的
+    fake-ip 集合。Any 协议（C4）：同时封 TCP 与 UDP/QUIC。"""
+    name = _ps_quote(config.rule_name_fakeip)
+    remote = _ps_array(list(ips))
+    script = (
+        f"$existing = Get-NetFirewallRule -DisplayName {name} -ErrorAction SilentlyContinue; "
+        f"if ($existing) {{ Remove-NetFirewallRule -DisplayName {name} -ErrorAction Stop }}; "
+        "New-NetFirewallRule -DisplayName " + name
+        + " -Direction Outbound -Action Block -Enabled True"
+        + " -RemoteAddress " + remote
+        + " | Out-Null"
+    )
+    _run_ps(script)
+
+
+def enable_fakeip(config: Config) -> None:
+    """启用 CG-FakeIP（阻断态）。Enable 后复查实际状态，不符则抛错。"""
+    _run_ps(
+        "Enable-NetFirewallRule -DisplayName "
+        + _ps_quote(config.rule_name_fakeip)
+    )
+    if get_status_fakeip(config) != STATUS_ENABLED:
+        raise FirewallError(
+            f"Enable-NetFirewallRule returned success but rule "
+            f"{config.rule_name_fakeip!r} is not Enabled (possibly deleted)"
+        )
+
+
+def disable_fakeip(config: Config) -> None:
+    """停用 CG-FakeIP（放行态）。仅门禁逻辑允许调用。"""
+    _run_ps(
+        "Disable-NetFirewallRule -DisplayName "
+        + _ps_quote(config.rule_name_fakeip)
+    )
+
+
+def get_status_fakeip(config: Config) -> RuleStatus:
+    """返回 CG-FakeIP 三态（ENABLED/DISABLED/MISSING）。规则不存在不抛异常。"""
+    out = _run_ps(_build_get_status_script(_ps_quote(config.rule_name_fakeip)))
+    return _parse_get_status_output(out)
+
+
+def ensure_exists_fakeip(config: Config, ips) -> None:
+    """确保 CG-FakeIP 存在；MISSING → 用 ips 重建（重建后为 Enabled），
+    DISABLED/ENABLED 不动作。"""
+    script = (
+        f"$r = Get-NetFirewallRule -DisplayName {_ps_quote(config.rule_name_fakeip)} "
+        "-ErrorAction SilentlyContinue; "
+        "if (-not $r) { Write-Output 'REBUILD' } else { Write-Output 'OK' }"
+    )
+    if _run_ps(script) == "REBUILD":
+        create_rule_fakeip(config, ips)
+
+
 # ----------------------------------------------------------------- smoke
 
 
@@ -375,6 +432,14 @@ def remove_rules(config: Config) -> None:
         + _ps_quote(config.rule_name_v6)
         + " -ErrorAction SilentlyContinue"
     )
+    # CG-FakeIP 一并清理（冒烟产物；不存在时 SilentlyContinue）
+    fakeip_name = getattr(config, "rule_name_fakeip", None)
+    if fakeip_name:
+        _run_ps(
+            "Remove-NetFirewallRule -DisplayName "
+            + _ps_quote(fakeip_name)
+            + " -ErrorAction SilentlyContinue"
+        )
 
 
 if __name__ == "__main__":

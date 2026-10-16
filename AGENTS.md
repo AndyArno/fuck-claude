@@ -33,7 +33,7 @@ main.py / scripts/run_guardian.py   打包入口 / 开发态入口（共用 main
 |---|---|---|
 | CG-Global | Anthropic IPv4 段 160.79.104.0/23（AS399358 独占） | 门控：环境脏 Enabled / 干净 Disabled |
 | CG-V6 | 2607:6bc0::/48, 2607:6bc0:11::/48 | **永久 Enabled，代码中不存在任何 disable 路径** |
-| CG-FakeIP | claude.ai 等 4 域名当前解析到的 fake-ip 地址 | 门控，与 CG-Global 同步（施工中） |
+| CG-FakeIP | claude.ai 等 4 域名当前解析到的 fake-ip 地址（getaddrinfo ∩ fakeip_range） | 门控，与 CG-Global 同步 Enable/Disable；fake-ip 映射会变，慢路径每轮重采集、变化即重建 |
 
 关键语义：CG-Global 只拦"直连泄漏路径"，不拦"经代理的正常访问"；CG-FakeIP 补齐
 "环境脏时让 Claude 完全不可用"（连 fake-ip 都拒，mihomo 收不到连接就不触发上游递归）。

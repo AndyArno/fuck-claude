@@ -26,7 +26,7 @@
 | 任务 | 产出 | 验证 |
 |---|---|---|
 | 1.1 项目骨架：git init、venv、依赖锁定（requirements.txt + 版本锁定见架构 §7）、config.json 模板 | 可运行的空壳 | `pip install -r requirements.txt` 通过 |
-| 1.2 `platform/firewall.py`：**双规则**——CG-Global（IPv4 门控：create/enable/disable/status）+ CG-V6（IPv6 永久封死：create/ensure_enabled，无 disable 接口） | PowerShell 封装模块 | 手动调用：CG-Global Enable 后 Edge 打不开 claude.ai；CG-V6 建立后（若可测）v6 直连不可达 |
+| 1.2 `platform/firewall.py`：**三规则**——CG-Global（IPv4 门控：create/enable/disable/status）+ CG-V6（IPv6 永久封死：create/ensure_enabled，无 disable 接口）+ CG-FakeIP（fake-ip 门控：create_rule_fakeip/enable/disable/status/ensure_exists，随 CG-Global 同步） | PowerShell 封装模块 | 手动调用：CG-Global Enable 后 Edge 打不开 claude.ai；CG-V6 建立后（若可测）v6 直连不可达 |
 | 1.3 冒烟脚本 `scripts/smoke_fw.py`：建双规则→阻断验证→放行验证→**存量连接行为实测**（架构 §3.3 注）→清理 | 一次性验证脚本 | B-1/B-3/B-4/B-6 通过 |
 
 ### M2：门禁核心（1.5d）

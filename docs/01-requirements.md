@@ -22,7 +22,7 @@
 
 | 编号 | 需求 | 验证标准 |
 |---|---|---|
-| B-1 | 默认阻断本机所有进程到 Anthropic IPv4 段（160.79.104.0/23）的出站连接（门控规则 CG-Global，随门禁切换） | 规则 Enabled 时，Edge 打不开 claude.ai、omp 无法调用 Claude API、Claude Code 无法连接 |
+| B-1 | 默认阻断本机所有进程到 Anthropic IPv4 段（160.79.104.0/23）的出站连接（门控规则 CG-Global，随门禁切换）；配套门控规则 **CG-FakeIP** 阻断 claude 域名当前解析到的 fake-ip（198.18.x.x）地址，掐断"浏览器 → fake-ip → TUN → mihomo → 代理"这条绕过 CG-Global 的泄漏路径——DNS 泄漏（ECS 带真实网段）恰恰发生在使用过程中，必须让连接根本到不了 mihomo | 规则 Enabled 时，Edge 打不开 claude.ai、omp 无法调用 Claude API、Claude Code 无法连接 |
 | B-2 | 阻断不依赖代理进程存活（内核级 WFP 规则） | 杀掉 verge-mihomo.exe 后阻断仍然有效 |
 | B-3 | 阻断不影响其他任何流量 | 阻断态下 YouTube、GitHub、游戏、其他模型商 API 全部正常 |
 | B-4 | 规则状态切换（Enable/Disable）。实测经 PowerShell cmdlet 单次调用 ~1.6–3s（修订：原"<100ms"基于 WFP API 直调，当前实现走 PS 子进程不可达，见架构 §8） | 切换在 3s 内完成；切换期间规则不会处于"半开"状态（cmdlet 原子生效） |
