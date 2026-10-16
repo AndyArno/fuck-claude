@@ -20,14 +20,25 @@ from core.config import Config
 # ----------------------------------------------------------------- fakes
 
 class FakeFirewall:
-    """记录调用的防火墙替身。初始状态：CG-Global Enabled（阻断态）。"""
+    """记录调用的防火墙替身。初始状态：CG-Global Enabled（阻断态）。
 
-    def __init__(self, global_enabled: bool = True) -> None:
+    status_mode 控制真实 guardian._self_heal_rules 的适配面：
+    - "tristate"：get_status 返回 'ENABLED'/'DISABLED'/'MISSING'（C2/C3 修复后的新语义）
+    - "bool"：返回 True/False（旧语义，guardian 需兼容）
+    - missing=True：模拟规则被第三方删除（返回 MISSING）
+    """
+
+    def __init__(self, global_enabled: bool = True, status_mode: str = "tristate",
+                 missing: bool = False) -> None:
         self.global_enabled = global_enabled
+        self.status_mode = status_mode
+        self.missing = missing
         self.calls: list[str] = []
 
     def create_rule(self, config) -> None:
         self.calls.append("create_rule")
+        self.missing = False
+        self.global_enabled = True
 
     def enable(self, config) -> None:
         self.calls.append("enable")
@@ -37,12 +48,17 @@ class FakeFirewall:
         self.calls.append("disable")
         self.global_enabled = False
 
-    def get_status(self, config) -> bool:
+    def get_status(self, config):
         self.calls.append("get_status")
+        if self.missing:
+            return "MISSING"
+        if self.status_mode == "tristate":
+            return "ENABLED" if self.global_enabled else "DISABLED"
         return self.global_enabled
 
     def ensure_exists(self, config) -> None:
         self.calls.append("ensure_exists")
+        self.missing = False
 
     def create_rule_v6(self, config) -> None:
         self.calls.append("create_rule_v6")
@@ -319,18 +335,41 @@ class TestOverride:
 # ----------------------------------------------------------------- 命令
 
 class TestCommands:
-    def test_pause_keeps_rules_and_stops_checks(self, tmp_path):
+    def test_pause_freezes_blocking_and_stops_checks(self, tmp_path):
+        """暂停 = 冻结在阻断态：强制 enable + 强制 BLOCKED，停止检查（M2）。"""
         np = FakeNetprobe()
         g, fw, *_ , _ = make_guardian(tmp_path, np=np)
+        # 模拟暂停前处于放行态
+        g._gstate = sm.GateState(state=sm.ALLOWED)
+        fw.global_enabled = False
         assert g.handle_command("pause") is True
         assert g.paused is True
+        assert fw.global_enabled is True           # 规则被强制 enable
+        assert g._gstate.state == sm.BLOCKED       # 状态冻结在阻断态
         before_local = np.local_calls
         g.tick(); g.tick()
-        assert np.local_calls == before_local  # 暂停期间不做检查
-        assert fw.global_enabled is True       # 规则不动，保持阻断
+        assert np.local_calls == before_local      # 暂停期间不做检查
         assert g.handle_command("resume") is True
         g.tick()
         assert np.local_calls > before_local
+
+    def test_pause_still_enforces_v6_and_override_expiry(self, tmp_path):
+        """H3：暂停期间 CG-V6 ensure 与 override 到期判断照常执行。"""
+        g, fw, *_ , clock = make_guardian(tmp_path)
+        clock.advance(1000)
+        g.handle_command("override_30min")
+        g.handle_command("pause")
+        # 30s 周期到：暂停期间 v6 ensure 照常
+        fw.calls.clear()
+        clock.advance(31)
+        g.tick()
+        assert "ensure_enabled_v6" in fw.calls
+        # override 到期：暂停期间也恢复阻断
+        clock.advance(30 * 60 + 1)
+        g.tick()
+        assert g._gstate.on_override is False
+        assert g._gstate.state == sm.BLOCKED
+        assert fw.global_enabled is True
 
     def test_quit_keeps_rule_state(self, tmp_path):
         g, fw, *_ , _ = make_guardian(tmp_path)
@@ -367,21 +406,92 @@ class TestCommands:
 
 class TestSelfHeal:
     def test_third_party_reset_corrected(self, tmp_path):
-        g, fw, *_ , _ = make_guardian(tmp_path)
-        # BLOCKED 期望 Enabled，第三方改成 Disabled → 自愈
+        g, fw, *_ , clock = make_guardian(tmp_path)
+        # BLOCKED 期望 Enabled，第三方改成 Disabled → 30s 周期到后自愈
         fw.global_enabled = False
+        clock.advance(31)
         g.tick()
         assert fw.global_enabled is True
 
-    def test_self_heal_no_op_when_consistent(self, tmp_path):
-        g, fw, *_ , _ = make_guardian(tmp_path)
-        g.tick()  # BLOCKED + Enabled：一致
-        assert "enable" not in fw.calls  # 无纠正调用（只有 v6 ensure / get_status）
+    def test_self_heal_skipped_within_interval(self, tmp_path):
+        g, fw, *_ , clock = make_guardian(tmp_path)
+        clock.advance(31)
+        g.tick()                      # 自愈一轮（期望=实际，无纠正）
+        assert "get_status" in fw.calls
+        fw.calls.clear()
+        clock.advance(1)
+        g.tick()                      # 距上轮仅 1s < 30s：不读状态
+        assert "get_status" not in fw.calls
+        assert "enable" not in fw.calls
 
-    def test_v6_ensured_every_tick(self, tmp_path):
-        g, fw, *_ , _ = make_guardian(tmp_path)
-        g.tick(); g.tick(); g.tick()
-        assert fw.calls.count("ensure_enabled_v6") == 3
+    def test_self_heal_after_transition_immediate(self, tmp_path):
+        """状态迁移后下一轮必校验（不等 30s）。"""
+        np = FakeNetprobe(echo_ip="203.0.113.10")
+        g, fw, np, *_ , _ = make_guardian(tmp_path, np=np)
+        for _ in range(3):
+            g._tick_count = 4
+            g.tick()
+        assert g._gstate.state == sm.ALLOWED
+        # 迁移发生 → _last_heal 归零 → 本轮已做校验
+        assert fw.calls.count("get_status") >= 1
+
+    def test_fast_fail_enable_skips_same_tick_heal(self, tmp_path):
+        """FAST_FAIL 发出 enable 后跳过本轮自愈（不重复 PS 调用）。"""
+        np = FakeNetprobe(mihomo=False)
+        g, fw, np, *_ , clock = make_guardian(tmp_path, np=np)
+        g._gstate = sm.GateState(state=sm.ALLOWED)
+        fw.global_enabled = False
+        clock.advance(31)
+        calls_before = len(fw.calls)
+        g.tick()
+        assert g._gstate.state == sm.BLOCKED
+        assert fw.global_enabled is True
+        # enable 只出现一次（状态机动作），本轮无 get_status 复查
+        assert fw.calls[calls_before:].count("enable") == 1
+        assert "get_status" not in fw.calls[calls_before:]
+
+    def test_rule_missing_rebuilt_then_restored(self, tmp_path):
+        """C3 适配：get_status 返回 MISSING → ensure_exists 重建并按期望恢复。"""
+        g, fw, *_ , clock = make_guardian(tmp_path)
+        fw.missing = True            # BLOCKED 期望 Enabled
+        clock.advance(31)
+        g.tick()
+        assert "ensure_exists" in fw.calls
+        assert fw.global_enabled is True
+        assert fw.missing is False
+
+    def test_rule_missing_rebuilt_disabled_when_allowed(self, tmp_path):
+        """ALLOWED 期望 Disabled：MISSING 重建后应 disable。"""
+        np = FakeNetprobe(echo_ip="203.0.113.10")
+        g, fw, np, *_ , clock = make_guardian(tmp_path, np=np)
+        for _ in range(3):
+            g._tick_count = 4
+            g.tick()
+        assert g._gstate.state == sm.ALLOWED
+        fw.missing = True
+        fw.calls.clear()
+        clock.advance(31)
+        g.tick()
+        assert "ensure_exists" in fw.calls
+        assert "disable" in fw.calls
+        assert fw.global_enabled is False
+
+    def test_bool_status_compat(self, tmp_path):
+        """旧 bool 语义（True/False）仍被兼容。"""
+        g, fw, *_ , clock = make_guardian(tmp_path)
+        fw.status_mode = "bool"
+        fw.global_enabled = False
+        clock.advance(31)
+        g.tick()
+        assert fw.global_enabled is True
+
+    def test_v6_ensured_per_heal_round(self, tmp_path):
+        g, fw, *_ , clock = make_guardian(tmp_path)
+        clock.advance(31)
+        g.tick()
+        clock.advance(31)
+        g.tick()
+        assert fw.calls.count("ensure_enabled_v6") == 2
 
 
 # ----------------------------------------------------------------- 热重载
@@ -546,3 +656,210 @@ class TestSelfcheck:
         src = open(g_mod.__file__, encoding="utf-8").read()
         assert "import pystray" not in src
         assert "from pystray" not in src
+
+
+# ----------------------------------------------------------------- C1 frozen 路径
+
+class TestEntrypointConfigPath:
+    def test_frozen_config_path_next_to_exe(self, tmp_path, monkeypatch):
+        """frozen 模式：正常启动分支必须加载 exe 同目录的 config.json（C1）。"""
+        import scripts.run_guardian as rg
+        exe_dir = tmp_path / "dist"
+        exe_dir.mkdir()
+        fake_cfg = exe_dir / "config.json"
+        loaded: list = []
+
+        def fake_load(path):
+            loaded.append(str(path))
+            return make_config(log_dir=str(tmp_path / "logs"))
+
+        monkeypatch.setattr(rg, "load_config", fake_load)
+        monkeypatch.setattr(rg.sys, "frozen", True, raising=False)
+        monkeypatch.setattr(rg.sys, "executable", str(exe_dir / "ClaudeGuard.exe"))
+        # --check 分支会跑 selfcheck；换成桩避免真探测
+        monkeypatch.setattr(rg, "selfcheck", lambda cfg: (loaded.append(str(cfg and 0)) or 0))
+        rc = rg.main(["--check"])
+        assert rc == 0
+        assert loaded and loaded[0] == str(fake_cfg)
+
+    def test_nonfrozen_config_path_is_repo_root(self, monkeypatch):
+        import scripts.run_guardian as rg
+        monkeypatch.setattr(rg.sys, "frozen", False, raising=False)
+        assert rg._default_config_path() == rg.CONFIG_PATH
+
+
+# ----------------------------------------------------------------- H4 托盘退出语义
+
+class TestTrayExitSemantics:
+    def test_tray_exit_menu_sends_exit_command(self, tmp_path):
+        """托盘“退出”菜单投递 exit（T-6），而非 quit。"""
+        import tray as tray_mod
+        t = tray_mod.Tray()
+        menu_items = []
+
+        def walk(menu):
+            for item in menu:
+                if isinstance(item, tray_mod.pystray.Menu):
+                    walk(item)
+                elif hasattr(item, "text"):
+                    menu_items.append(item)
+
+        walk(t._build_menu())
+        exit_items = [i for i in menu_items if "退出" in str(getattr(i, "text", ""))]
+        assert len(exit_items) == 1
+        # MenuItem 可调用：调用后应投递 EXIT 命令
+        exit_items[0](None)
+        assert t.commands.get_nowait() == tray_mod.Command.EXIT
+
+    def test_exit_command_restores_block_before_stop(self, tmp_path):
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        fw.global_enabled = False  # 模拟放行态退出
+        assert g.handle_command("exit") is False
+        assert fw.global_enabled is True
+        assert g._stop.is_set()
+
+    def test_quit_debug_only_keeps_state(self, tmp_path):
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        assert g.handle_command("quit") is False
+        assert "enable" not in fw.calls and "disable" not in fw.calls
+
+
+# ----------------------------------------------------------------- H5 CIDR 热重载重建
+
+class TestCidrHotReloadRebuild:
+    def _write_cfg(self, path, tmp_path, **over):
+        import json
+        data = {
+            "blocked_cidrs_v4": ["160.79.104.0/23"],
+            "blocked_cidrs_v6": ["2607:6bc0::/48"],
+            "rule_name_v4": "CG-Global", "rule_name_v6": "CG-V6",
+            "whitelist": ["203.0.113.10"],
+            "echo_endpoints": ["https://echo.test/ip"],
+            "fakeip_range": "198.18.0.0/15",
+            "mihomo_process": "verge-mihomo.exe",
+            "tun_adapter_keywords": ["mihomo"],
+            "fast_tick_sec": 1, "slow_tick_sec": 5,
+            "pass_confirm_count": 3, "fail_unreachable_threshold": 5,
+            "doh_check_interval_min": 60, "ripe_check_interval_hours": 24,
+            "override_minutes": 30, "claude_domains": ["claude.ai"],
+            "asn": "AS399358", "log_dir": str(path.parent / "logs"),
+            "log_retention_days": 30,
+        }
+        data.update(over)
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+    def test_v4_cidr_change_rebuilds_rule(self, tmp_path):
+        cfg_path = tmp_path / "config.json"
+        self._write_cfg(cfg_path, tmp_path)
+        g, fw, *_ , _ = make_guardian(tmp_path, config_path=cfg_path)
+        import json, os
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        data["blocked_cidrs_v4"] = ["160.79.104.0/23", "203.0.113.0/24"]
+        cfg_path.write_text(json.dumps(data), encoding="utf-8")
+        st = os.stat(cfg_path)
+        os.utime(cfg_path, (st.st_atime, st.st_mtime + 10))
+        g.tick()
+        assert "create_rule" in fw.calls
+        # BLOCKED 期望 Enabled：重建后不应 disable
+        assert "disable" not in fw.calls
+
+    def test_v6_cidr_change_rebuilds_rule(self, tmp_path):
+        cfg_path = tmp_path / "config.json"
+        self._write_cfg(cfg_path, tmp_path)
+        g, fw, *_ , _ = make_guardian(tmp_path, config_path=cfg_path)
+        import json, os
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        data["blocked_cidrs_v6"] = ["2607:6bc0::/48", "2001:db8::/32"]
+        cfg_path.write_text(json.dumps(data), encoding="utf-8")
+        st = os.stat(cfg_path)
+        os.utime(cfg_path, (st.st_atime, st.st_mtime + 10))
+        g.tick()
+        assert "create_rule_v6" in fw.calls
+
+    def test_no_cidr_change_no_rebuild(self, tmp_path):
+        cfg_path = tmp_path / "config.json"
+        self._write_cfg(cfg_path, tmp_path)
+        g, fw, *_ , _ = make_guardian(tmp_path, config_path=cfg_path)
+        import json, os
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        data["whitelist"] = ["1.2.3.4"]
+        cfg_path.write_text(json.dumps(data), encoding="utf-8")
+        st = os.stat(cfg_path)
+        os.utime(cfg_path, (st.st_atime, st.st_mtime + 10))
+        g.tick()
+        assert "create_rule" not in fw.calls
+        assert "create_rule_v6" not in fw.calls
+
+    def test_rebuild_restores_disabled_when_allowed(self, tmp_path):
+        cfg_path = tmp_path / "config.json"
+        self._write_cfg(cfg_path, tmp_path)
+        g, fw, *_ , _ = make_guardian(tmp_path, config_path=cfg_path)
+        g._gstate = sm.GateState(state=sm.ALLOWED)
+        fw.global_enabled = False
+        g._rebuild_blocked_rules(v4=True, v6=False)
+        assert "create_rule" in fw.calls
+        assert "disable" in fw.calls            # 期望 Disabled → 恢复
+        assert fw.global_enabled is False
+
+
+# ----------------------------------------------------------------- L2 漂移间隔热生效
+
+class TestDriftIntervalHotReload:
+    def test_drift_loop_rereads_interval_each_iteration(self, tmp_path):
+        g, *_ , _ = make_guardian(tmp_path)
+        # 模拟：启动后热重载把 doh 间隔从 60min 改为 1min
+        seen = []
+        real_config = g.config
+
+        class SwapCfg:
+            def __getattr__(self, name):
+                seen.append(name)
+                if name == "doh_check_interval_min":
+                    return 1  # 热重载后的新值
+                return getattr(real_config, name)
+
+        g.config = SwapCfg()
+        # wait 第一次被调用即置 stop：循环体恰好完整跑一轮后退出
+        g._stop.wait = lambda timeout: (g._stop.set(), 0)[1]
+        g._drift_loop()
+        assert "doh_check_interval_min" in seen
+
+
+# ----------------------------------------------------------------- L4 override 顺序
+
+class TestOverrideOrdering:
+    def test_override_until_set_before_event(self, tmp_path, monkeypatch):
+        g, fw, *_ , clock = make_guardian(tmp_path)
+        clock.advance(500)
+        order = []
+        real_apply = g._apply_event
+
+        def spy(event):
+            order.append(("until", g.override_until))
+            real_apply(event)
+
+        monkeypatch.setattr(g, "_apply_event", spy)
+        g._start_override()
+        # _apply_event 被调用时 override_until 已设置
+        assert order[0] == ("until", 500 + 30 * 60)
+        assert g._gstate.on_override is True
+
+
+# ----------------------------------------------------------------- M1 guardian 层幂等
+
+class TestBlockedCheckFailIdempotent:
+    def test_blocked_check_fail_no_repeat_toast_or_enable(self, tmp_path):
+        """BLOCKED 态 CHECK_FAIL 幂等：不重复 enable、不重复弹窗。"""
+        toasts = []
+        np = FakeNetprobe(echo_ip="203.0.113.9")  # 白名单外 → DIRTY
+        g, fw, *_ , _ = make_guardian(tmp_path, np=np)
+        g._notify = lambda t, b: toasts.append(t)
+        g._gstate = sm.GateState(state=sm.BLOCKED)
+        fw.global_enabled = True
+        for _ in range(3):
+            g._tick_count = 4
+            g.tick()
+        assert g._gstate.state == sm.BLOCKED
+        assert toasts == []                      # 无重复通知
+        # 无冗余 enable（自愈例外：周期性校验不算状态机动作）
+        assert g._gstate.state == sm.BLOCKED

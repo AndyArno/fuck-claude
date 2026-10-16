@@ -38,6 +38,25 @@ class FirewallPermissionError(FirewallError):
     """缺少管理员权限（NetSecurity cmdlet 需要 elevated shell）。"""
 
 
+class FirewallTimeoutError(FirewallError):
+    """PowerShell 子进程超时（如冷启动超过时限）——与权限错误分开，
+    超时不代表需要管理员权限，不应误导排障。"""
+
+
+# 规则三态：Enabled / Disabled / 规则不存在（被第三方删除等）
+class RuleStatus(str):
+    """规则状态字符串。真值即“Enabled”，可直接用于 bool() 判断，
+    便于既有调用方 `bool(get_status(...))` 无缝兼容三态语义。"""
+
+    def __bool__(self) -> bool:
+        return self == "ENABLED"
+
+
+STATUS_ENABLED = RuleStatus("ENABLED")
+STATUS_DISABLED = RuleStatus("DISABLED")
+STATUS_MISSING = RuleStatus("MISSING")
+
+
 class RuleNotFoundError(FirewallError):
     """查询的规则不存在。"""
 
@@ -61,11 +80,10 @@ def _run_ps(script: str) -> str:
             timeout=_PS_TIMEOUT,
         )
     except subprocess.TimeoutExpired as exc:
-        # 非管理员下部分 cmdlet 可能触发 UAC/慢路径挂起而非快速报错；
-        # 统一归入权限路径，避免门禁主循环误判为环境故障。
-        raise FirewallPermissionError(
-            f"NoAdministrativeRights: PowerShell timed out after {_PS_TIMEOUT}s "
-            "(likely non-elevated shell / UAC prompt)"
+        # 超时≠权限问题：PS 冷启动可能超过 10s（非管理员），也可能是系统
+        # 卡顿。归入独立超时异常，避免误报“需要管理员”误导排障。
+        raise FirewallTimeoutError(
+            f"PowerShell timed out after {_PS_TIMEOUT}s"
         ) from exc
     except OSError as exc:
         raise FirewallError(f"Failed to launch PowerShell: {exc}") from exc
@@ -118,18 +136,24 @@ def create_rule(config: Config) -> None:
         f"if ($existing) {{ Remove-NetFirewallRule -DisplayName {name} -ErrorAction Stop }}; "
         "New-NetFirewallRule -DisplayName " + name
         + " -Direction Outbound -Action Block -Enabled True"
-        + " -Protocol TCP -RemoteAddress " + remote
+        + " -RemoteAddress " + remote  # 不指定协议 = Any：同时封 TCP 与 UDP/QUIC
         + " | Out-Null"
     )
     _run_ps(script)
 
 
 def enable(config: Config) -> None:
-    """启用 CG-Global（阻断态）。"""
+    """启用 CG-Global（阻断态）。Enable 后复查实际状态，不符则抛错
+    （防止对不存在规则 enable 时 cmdlet exit 0 的假成功）。"""
     _run_ps(
         "Enable-NetFirewallRule -DisplayName "
         + _ps_quote(config.rule_name_v4)
     )
+    if get_status(config) != STATUS_ENABLED:
+        raise FirewallError(
+            f"Enable-NetFirewallRule returned success but rule "
+            f"{config.rule_name_v4!r} is not Enabled (possibly deleted)"
+        )
 
 
 def disable(config: Config) -> None:
@@ -140,25 +164,44 @@ def disable(config: Config) -> None:
     )
 
 
-def get_status(config: Config) -> bool:
-    """返回 CG-Global 是否 Enabled。规则不存在 → False（不抛异常）。"""
-    name = _ps_quote(config.rule_name_v4)
-    script = (
+def _build_get_status_script(name: str) -> str:
+    """构造查询规则状态的 PS 脚本（纯函数，可离线单测）。name 需先经 _ps_quote。"""
+    return (
         f"$r = Get-NetFirewallRule -DisplayName {name} -ErrorAction SilentlyContinue; "
-        "if ($r) { ($r | Get-NetFirewallRule).Enabled } "
+        "if ($r) { $r.Enabled } "
         "else { Write-Output 'MISSING' }"
     )
-    out = _run_ps(script)
-    if out == "MISSING":
-        return False
-    return out.lower() == "true"
+
+
+def _parse_get_status_output(out: str) -> RuleStatus:
+    """解析 get_status 的 PS stdout（纯函数，可离线单测）。
+
+    期望输出：'True' / 'False' / 'MISSING'。空输出或乱码按 MISSING 处理
+    （下一轮自愈 ensure_exists 会重建），绝不猜成 Enabled。
+    """
+    out = (out or "").strip()
+    if out.lower() == "true":
+        return STATUS_ENABLED
+    if out.lower() == "false":
+        return STATUS_DISABLED
+    return STATUS_MISSING
+
+
+def get_status(config: Config) -> RuleStatus:
+    """返回 CG-Global 三态（ENABLED/DISABLED/MISSING）。规则不存在不抛异常。
+
+    返回值为 RuleStatus(str)：bool() 语义 = 是否 Enabled，
+    兼容旧调用方 `bool(get_status(...))`。
+    """
+    out = _run_ps(_build_get_status_script(_ps_quote(config.rule_name_v4)))
+    return _parse_get_status_output(out)
 
 
 def ensure_exists(config: Config) -> None:
-    """规则缺失（被第三方安全软件删掉）时重建；存在则不动作。"""
-    name = _ps_quote(config.rule_name_v4)
+    """确保 CG-Global 存在；MISSING → 重建（重建后为 Enabled），DISABLED/ENABLED 不动作。"""
     script = (
-        f"$r = Get-NetFirewallRule -DisplayName {name} -ErrorAction SilentlyContinue; "
+        f"$r = Get-NetFirewallRule -DisplayName {_ps_quote(config.rule_name_v4)} "
+        "-ErrorAction SilentlyContinue; "
         "if (-not $r) { Write-Output 'REBUILD' } else { Write-Output 'OK' }"
     )
     if _run_ps(script) == "REBUILD":
@@ -176,7 +219,7 @@ def create_rule_v6(config: Config) -> None:
         f"if ($existing) {{ Remove-NetFirewallRule -DisplayName {name} -ErrorAction Stop }}; "
         "New-NetFirewallRule -DisplayName " + name
         + " -Direction Outbound -Action Block -Enabled True"
-        + " -Protocol TCP -RemoteAddress " + remote
+        + " -RemoteAddress " + remote  # 不指定协议 = Any：同时封 TCP 与 UDP/QUIC
         + " | Out-Null"
     )
     _run_ps(script)
@@ -199,17 +242,10 @@ def ensure_enabled_v6(config: Config) -> None:
         _run_ps("Enable-NetFirewallRule -DisplayName " + name)
 
 
-def get_status_v6(config: Config) -> bool:
-    """返回 CG-V6 是否存在且 Enabled。供每轮校验使用。"""
-    name = _ps_quote(config.rule_name_v6)
-    script = (
-        f"$r = Get-NetFirewallRule -DisplayName {name} -ErrorAction SilentlyContinue; "
-        "if ($r) { $r.Enabled } else { Write-Output 'MISSING' }"
-    )
-    out = _run_ps(script)
-    if out == "MISSING":
-        return False
-    return out.lower() == "true"
+def get_status_v6(config: Config) -> RuleStatus:
+    """返回 CG-V6 三态（ENABLED/DISABLED/MISSING）。供每轮校验使用。"""
+    out = _run_ps(_build_get_status_script(_ps_quote(config.rule_name_v6)))
+    return _parse_get_status_output(out)
 
 
 # ----------------------------------------------------------------- smoke

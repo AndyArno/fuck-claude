@@ -31,7 +31,6 @@ from core.messages import (
 
 class State(enum.Enum):
     BLOCKED = "阻断"
-    PROBING = "探测中"
     ALLOWED = "放行"
     # DRIFT_ALARM 为正交标志位，附着于任意状态
 
@@ -42,7 +41,8 @@ class Command(enum.Enum):
     PAUSE = "pause"
     RESUME = "resume"
     EDIT_WHITELIST = "edit_whitelist"
-    QUIT = "quit"
+    EXIT = "exit"  # T-6：退出前恢复阻断（Enabled）
+    QUIT = "quit"  # 仅调试：保持当前规则状态退出
 
 
 @dataclass
@@ -83,7 +83,6 @@ class StateEvent:
             return "yellow"
         return {
             State.BLOCKED: "red",
-            State.PROBING: "yellow",
             State.ALLOWED: "green",
         }[self.state]
 
@@ -187,7 +186,7 @@ class Tray:
             pystray.MenuItem("恢复守护", self._menu_cb(Command.RESUME)),
             pystray.MenuItem("编辑白名单", self._menu_cb(Command.EDIT_WHITELIST)),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("退出", self._menu_cb(Command.QUIT)),
+            pystray.MenuItem("退出（恢复阻断）", self._menu_cb(Command.EXIT)),
         )
 
     def _show_details(self, icon, item) -> None:

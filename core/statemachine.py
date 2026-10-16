@@ -1,6 +1,6 @@
 """Gate state machine (pure logic, no side effects).
 
-States: BLOCKED / PROBING / ALLOWED, plus orthogonal DRIFT_ALARM flag.
+States: BLOCKED / ALLOWED, plus orthogonal DRIFT_ALARM flag.
 transition(state, event) -> (new_state, actions) where actions is a list
 of instruction dicts for the platform layer (firewall / notify).
 
@@ -12,7 +12,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 BLOCKED = "BLOCKED"
-PROBING = "PROBING"
 ALLOWED = "ALLOWED"
 
 FAST_FAIL = "FAST_FAIL"
@@ -83,13 +82,16 @@ def transition(state: GateState, event: str) -> Transition:
         if state.state == BLOCKED:
             # Matrix #11: idempotent, no repeated notify.
             return Transition(state)
-        # Matrix #10: ALLOWED/PROBING + FAST_FAIL → immediate block,
+        # Matrix #10: ALLOWED + FAST_FAIL → immediate block,
         # no confirmation window, no tolerance.
         return Transition(GateState(BLOCKED, state.drift_alarm, False),
                           [{"action": ENABLE_FIREWALL},
                            {"action": NOTIFY_BLOCK, "message": "fast_fail"}])
 
     if event == CHECK_FAIL:
+        if state.state == BLOCKED:
+            # Matrix #11 (same as FAST_FAIL): idempotent, no repeated notify.
+            return Transition(state)
         # DIRTY exit or local check failure: immediate block, no tolerance (G-4).
         return Transition(GateState(BLOCKED, state.drift_alarm, False),
                           [{"action": ENABLE_FIREWALL},
@@ -98,14 +100,12 @@ def transition(state: GateState, event: str) -> Transition:
     if event == PROBE_UNREACHABLE:
         # Counting escalation happens in checks.py; the state machine only
         # sees the escalated event as CHECK_FAIL. A bare PROBE_UNREACHABLE
-        # in ALLOWED keeps state (matrix #4); in BLOCKED/PROBING, hold.
+        # in ALLOWED keeps state (matrix #4); in BLOCKED, hold.
         return Transition(state)
 
     if event == CHECK_PASS:
         if state.state == ALLOWED:
             return Transition(state)  # already allowed; no repeat notify
-        if state.state == PROBING:
-            return Transition(state)  # confirmation window managed by checks.py
         # BLOCKED + confirmed N consecutive passes → release (matrix #1).
         return Transition(GateState(ALLOWED, state.drift_alarm, False),
                           [{"action": DISABLE_FIREWALL},

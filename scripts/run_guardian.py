@@ -45,7 +45,7 @@ def main(argv: list[str], config_path: Path | None = None) -> int:
         return selfcheck(config)
 
     try:
-        config = load_config(CONFIG_PATH)
+        config = load_config(config_path)
     except ConfigError as exc:
         print(f"配置错误：{exc}")
         return 2

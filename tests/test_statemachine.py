@@ -52,10 +52,10 @@ def test_matrix_02_pass_then_fail_resets_streak_stays_blocked():
     chk.evaluate(local_ok, pol.CLEAN, counter)
     chk.evaluate(local_ok, pol.CLEAN, counter)
     assert chk.evaluate(local_ok, pol.CLEAN, counter) == "PASS_CONFIRMED"
-    # state machine: PROBING hold until confirmed
-    t = sm.transition(mk_gate(sm.PROBING), sm.CHECK_FAIL)
+    # state machine: CHECK_FAIL stays in BLOCKED idempotently (no repeat actions)
+    t = sm.transition(mk_gate(sm.BLOCKED), sm.CHECK_FAIL)
     assert t.new_state.state == sm.BLOCKED
-    assert sm.ENABLE_FIREWALL in acts(t)
+    assert sm.ENABLE_FIREWALL not in acts(t)
 
 
 # --- Matrix #3: ALLOWED + 1次FAIL → BLOCKED（立即，无确认窗）
@@ -129,12 +129,9 @@ def test_matrix_09_partial_local_checks_hold_blocked():
     counter = chk.CheckCounter(3, 5)
     mid = {"mihomo_alive": True, "tun_present": True, "fakeip_ok": False}
     assert chk.evaluate(mid, pol.CLEAN, counter) == "BLOCK_NOW"
-    # state machine: single pass event from BLOCKED must never release (needs ×N)
-    t2 = sm.transition(mk_gate(sm.PROBING), sm.CHECK_PASS)
-    assert t2.new_state.state == sm.PROBING
-    assert sm.DISABLE_FIREWALL not in acts(t2)
-    # premature-release gating lives in checks.py (verified above); the SM
-    # only releases on the CHECK_PASS event guardian sends after PASS_CONFIRMED.
+    # guardian only sends CHECK_PASS after PASS_CONFIRMED (checks.py gating);
+    # the SM itself releases on the event (matrix #1). No PROBING hold anymore.
+    # premature-release gating lives in checks.py (verified above).
 
 
 # --- Matrix #10: ALLOWED + FAST_FAIL → 立即 BLOCKED，无任何确认/容忍计数
@@ -159,10 +156,14 @@ def test_matrix_12_dirty_blocks_immediately_from_any_state():
     for _ in range(2):  # even first dirty probe after passes
         pass
     assert counter.record(dirty_outcome()) == "BLOCK_NOW"
-    for st in (sm.BLOCKED, sm.PROBING, sm.ALLOWED):
+    for st in (sm.ALLOWED,):
         t = sm.transition(mk_gate(st), sm.CHECK_FAIL)
         assert t.new_state.state == sm.BLOCKED
         assert sm.ENABLE_FIREWALL in acts(t)
+    # BLOCKED + CHECK_FAIL is idempotent (same as FAST_FAIL, matrix #11):
+    t = sm.transition(mk_gate(sm.BLOCKED), sm.CHECK_FAIL)
+    assert t.new_state.state == sm.BLOCKED
+    assert t.actions == []
     # dirty during override still blocked at expire, and DIRTY never tolerated:
     counter2 = chk.CheckCounter(3, 5)
     counter2.record(clean_outcome())
@@ -174,7 +175,7 @@ def test_matrix_12_dirty_blocks_immediately_from_any_state():
 def test_v6_rules_never_appear_in_actions():
     events = [sm.FAST_FAIL, sm.CHECK_PASS, sm.CHECK_FAIL, sm.PROBE_UNREACHABLE,
               sm.OVERRIDE_START, sm.OVERRIDE_EXPIRE, sm.DRIFT_DETECTED]
-    for st in (sm.BLOCKED, sm.PROBING, sm.ALLOWED):
+    for st in (sm.BLOCKED, sm.ALLOWED):
         for drift in (False, True):
             for ov in (False, True):
                 for ev in events:

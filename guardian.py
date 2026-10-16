@@ -118,6 +118,12 @@ class Guardian:
         self.paused = False
         self.override_until: float | None = None
 
+        # 规则自愈节奏（H1）：PS 子进程单次 ~1.6s，不能塞进每个快 tick。
+        # 30s 一轮 + 状态迁移后首轮必校验，兼顾 B-7 时序与自愈时效。
+        self._heal_interval = 30.0
+        self._last_heal = 0.0
+        self._skip_heal = False
+
         self._tick_count = 0
         self._slow_every = max(
             1, round(config.slow_tick_sec / max(1, config.fast_tick_sec))
@@ -183,8 +189,22 @@ class Guardian:
         # ③ 漂移线程投递的事件
         self._drain_incoming()
 
+        # ③ 暂停守护：只停“检查”，不放弃已有安全职责——
+        #   - override 到期判断照常（否则 override+暂停 = 无限期放行）
+        #   - CG-V6 每轮强制 Enabled 照常（B-6 与暂停无关）
+        #   - 规则冻结在阻断态（pause 命令处理时已 enable）
         if self.paused:
-            # 暂停守护：不检查、不动规则，保持阻断态不变
+            if self._gstate.on_override and self.override_until is not None \
+                    and self._clock() >= self.override_until:
+                self._log_audit("end")
+                self.log.info("Override 到期（暂停期间），恢复阻断")
+                self.override_until = None
+                self._counter.reset()
+                self._apply_event(sm.OVERRIDE_EXPIRE)
+            try:
+                self.fw.ensure_enabled_v6(self.config)
+            except Exception as exc:
+                self.log.warning("暂停期间 CG-V6 ensure 失败：%s", exc)
             self._push_tray()
             return True
 
@@ -213,10 +233,18 @@ class Guardian:
 
         # ⑦ 转移 + 副作用
         if event is not None:
+            old_state = self._gstate.state
             self._apply_event(event)
+            # FAST_FAIL 发出 enable 后跳过本轮自愈（避免重复 PS 调用）
+            if event == sm.FAST_FAIL and old_state != sm.BLOCKED:
+                self._skip_heal = True
 
-        # ⑧ 规则自愈（每轮）：CG-Global 与期望一致 + CG-V6 永久封死
-        self._self_heal_rules()
+        # ⑧ 规则自愈（默认 30s 一轮；状态迁移/动作后首轮提前；FAST_FAIL 后跳过）
+        if self._skip_heal:
+            self._skip_heal = False
+        elif self._clock() - self._last_heal >= self._heal_interval:
+            self._last_heal = self._clock()
+            self._self_heal_rules()
 
         # ⑨ 通知 UI
         self._push_tray()
@@ -294,6 +322,9 @@ class Guardian:
             self.log.info("状态转移 %s --%s--> %s actions=%s",
                           old.state, event, self._gstate.state,
                           [a["action"] for a in tr.actions])
+        # 状态迁移或动作发出后，下一轮（含本轮稍后的自愈阶段）优先校验规则实际状态
+        if tr.actions or old != self._gstate:
+            self._last_heal = float("-inf")
 
     def _execute(self, actions: list[dict]) -> None:
         for a in actions:
@@ -360,19 +391,37 @@ class Guardian:
             self.log.error("CG-V6 预热失败：%s", exc)
 
     def _self_heal_rules(self) -> None:
-        """每轮校验 CG-Global 实际状态与状态机期望一致；CG-V6 每轮 ensure。"""
+        """校验 CG-Global 实际状态与状态机期望一致；CG-V6 永久封死。
+
+        每轮都跑（PS 每次约 1.6s）会把 tick 拖到 4s+，违反 B-7 的 2s 阻断线，
+        因此移出快路径：默认每 heal_interval_sec=30s 一轮；状态迁移后首轮
+        必校验（迁移点 enable/disable 已是权威写入，无需立刻复查，但第三方
+        竞争窗口最短路径是迁移后尽早发现）。FAST_FAIL 分支发出 enable 后
+        跳过本轮（调用方置 _skip_heal）。
+        """
         expected_enabled = not (
             self._gstate.state == sm.ALLOWED or self._gstate.on_override
         )
         try:
-            actual = bool(self.fw.get_status(self.config))
+            actual = self.fw.get_status(self.config)
         except Exception as exc:
             self.log.warning("读取 CG-Global 状态失败（跳过本轮自愈）：%s", exc)
-            actual = None
-        if actual is not None and actual != expected_enabled:
+            return
+        # 兼容两种语义：旧 bool（True/False）与新三态字符串
+        # （'ENABLED'/'DISABLED'/'MISSING'）。MISSING → 重建。
+        actual_str = str(actual).upper() if isinstance(actual, str) else None
+        if actual_str == "MISSING":
+            self.log.warning("CG-Global 规则缺失（可能被第三方删除），重建中")
+            if self._fw_tolerant("ensure_exists"):
+                # 重建后按期望状态恢复（create_rule 默认 Enabled）
+                if not expected_enabled:
+                    self._fw_tolerant("disable")
+            return
+        actual_enabled = actual_str == "ENABLED" if actual_str else bool(actual)
+        if actual_enabled != expected_enabled:
             self.log.warning(
                 "CG-Global 实际状态 %s 与期望 %s 不符（可能被第三方重置），纠正中",
-                "Enabled" if actual else "Disabled",
+                "Enabled" if actual_enabled else "Disabled",
                 "Enabled" if expected_enabled else "Disabled",
             )
             self._fw_tolerant("enable" if expected_enabled else "disable")
@@ -405,8 +454,12 @@ class Guardian:
             if not self.paused:
                 self.paused = True
                 self._counter.reset()
-                # 不动规则：保持阻断态不变，只停检查
-                self.log.info("守护已暂停（规则保持当前实际状态）")
+                # 暂停语义 = 冻结在阻断态（fail-closed，安全优先）：
+                # 强制 enable 规则，即使暂停前处于放行态/override。
+                self._fw_tolerant("enable")
+                self._gstate = sm.GateState(
+                    sm.BLOCKED, self._gstate.drift_alarm, self._gstate.on_override)
+                self.log.info("守护已暂停（规则冻结在阻断态，不执行检查）")
         elif cmd == "resume":
             if self.paused:
                 self.paused = False
@@ -435,8 +488,9 @@ class Guardian:
         if self._gstate.on_override:
             self.log.info("Override 已在进行中，忽略重复请求")
             return
-        self._apply_event(sm.OVERRIDE_START)
+        # 先设计时再施加副作用：若 _apply_event 中途异常，到期判定仍能恢复
         self.override_until = self._clock() + self.config.override_minutes * 60
+        self._apply_event(sm.OVERRIDE_START)
         self._counter.reset()
         self._log_audit(
             f"start duration_min={self.config.override_minutes}")
@@ -491,11 +545,38 @@ class Guardian:
             self._gstate = sm.GateState(
                 self._gstate.state, False, self._gstate.on_override)
         changed = []
+        v4_changed = old.blocked_cidrs_v4 != new_cfg.blocked_cidrs_v4
+        v6_changed = old.blocked_cidrs_v6 != new_cfg.blocked_cidrs_v6
+        if v4_changed:
+            changed.append(f"blocked_cidrs_v4={new_cfg.blocked_cidrs_v4}")
+        if v6_changed:
+            changed.append(f"blocked_cidrs_v6={new_cfg.blocked_cidrs_v6}")
         if old.whitelist != new_cfg.whitelist:
             changed.append(f"whitelist={new_cfg.whitelist}")
-        if old.blocked_cidrs_v4 != new_cfg.blocked_cidrs_v4:
-            changed.append(f"blocked_cidrs_v4={new_cfg.blocked_cidrs_v4}")
+        # 封禁段变化必须重建 WFP 规则（RemoteAddress 只在 create 时写入），
+        # 否则日志“已更新”但规则仍封旧 CIDR（H5 断点）。
+        if v4_changed or v6_changed:
+            self._rebuild_blocked_rules(v4_changed, v6_changed)
         self.log.info("配置热重载完成 %s", "；".join(changed) or "（无字段变化）")
+
+    def _rebuild_blocked_rules(self, v4: bool, v6: bool) -> None:
+        """按当前期望状态重建封禁规则（create_rule 覆盖重建后恢复 Enabled/Disabled）。"""
+        expected_enabled = not (
+            self._gstate.state == sm.ALLOWED or self._gstate.on_override
+        )
+        if v4:
+            if self._fw_tolerant("create_rule"):
+                if not expected_enabled:
+                    self._fw_tolerant("disable")
+                self.log.info("CG-Global 已按新 blocked_cidrs_v4 重建")
+        if v6:
+            if self._fw_tolerant("create_rule_v6"):
+                # CG-V6 语义：永久 Enabled（B-6），重建后必须恢复
+                try:
+                    self.fw.ensure_enabled_v6(self.config)
+                except Exception as exc:
+                    self.log.warning("CG-V6 重建后恢复 Enabled 失败：%s", exc)
+                self.log.info("CG-V6 已按新 blocked_cidrs_v6 重建")
 
     # ------------------------------------------------------------------ 漂移监控
 
@@ -512,12 +593,13 @@ class Guardian:
 
     def _drift_loop(self) -> None:
         """独立守护线程：DoH 每 doh_check_interval_min、RIPE 每 ripe_check_interval_hours。
-        只产生 DRIFT_DETECTED 事件，绝不动规则（D-3）；失败不影响主循环（D-4）。"""
-        doh_every = self.config.doh_check_interval_min * 60
-        ripe_every = self.config.ripe_check_interval_hours * 3600
+        只产生 DRIFT_DETECTED 事件，绝不动规则（D-3）；失败不影响主循环（D-4）。
+        每轮循环重读间隔配置：热重载改 doh/ripe 间隔立即生效（L2）。"""
         next_doh = 0.0  # 启动即查一次
         next_ripe = 0.0
         while not self._stop.is_set():
+            doh_every = self.config.doh_check_interval_min * 60
+            ripe_every = self.config.ripe_check_interval_hours * 3600
             now = time.time()
             if now >= next_doh:
                 next_doh = now + doh_every
@@ -580,7 +662,6 @@ class Guardian:
 
             state_map = {
                 sm.BLOCKED: State.BLOCKED,
-                sm.PROBING: State.PROBING,
                 sm.ALLOWED: State.ALLOWED,
             }
             evt = StateEvent(
