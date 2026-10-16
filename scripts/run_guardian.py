@@ -27,10 +27,18 @@ from guardian import Guardian, selfcheck, setup_logging  # noqa: E402
 CONFIG_PATH = _ROOT / "config.json"
 
 
-def main(argv: list[str]) -> int:
+def _default_config_path() -> Path:
+    """打包后 config.json 与 exe 同目录（用户可编辑，不在 _MEIPASS 内）。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "config.json"
+    return CONFIG_PATH
+
+
+def main(argv: list[str], config_path: Path | None = None) -> int:
+    config_path = config_path or _default_config_path()
     if "--check" in argv:
         try:
-            config = load_config(CONFIG_PATH)
+            config = load_config(config_path)
         except ConfigError as exc:
             print(f"配置错误：{exc}")
             return 2
@@ -43,7 +51,7 @@ def main(argv: list[str]) -> int:
         return 2
     log = setup_logging(config)
 
-    log.info("===== Claude Guard 启动（开发态入口）=====")
+    log.info("===== Claude Guard 启动（config: %s）=====", config_path)
     try:
         from tray import Tray
     except Exception as exc:
@@ -51,7 +59,7 @@ def main(argv: list[str]) -> int:
         return 1
 
     tray = Tray()
-    guardian = Guardian(config, CONFIG_PATH, tray=tray, logger=log)
+    guardian = Guardian(config, config_path, tray=tray, logger=log)
 
     stop_done = threading.Event()
 
