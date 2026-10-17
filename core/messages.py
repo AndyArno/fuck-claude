@@ -13,14 +13,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-
 TOAST_TITLE = "Claude Guard"
 
 # 排障技术细节与主结论之间的分隔线
 TECH_SEPARATOR = "——技术细节——"
 
-# 漂移提示（托盘详情气泡 / Toast 共用）
-DRIFT_HINT = "⚠ Claude 相关的 IP 段发生了变化，请检查白名单是否需要更新"
+# 漂移提示（托盘详情气泡 / Toast 共用）。漂移检测比对的是封禁 IP 段
+# （blocked_cidrs，Claude 在 Anthropic 侧的落地网段），不是出口白名单——
+# 提示必须指向正确的配置项，否则用户改白名单永远解决不了告警。
+DRIFT_HINT = "⚠ Claude 相关的 IP 段发生了变化，请检查配置里的拦截 IP 段是否需要更新"
 
 
 @dataclass(frozen=True)
@@ -38,7 +39,11 @@ class Status:
     proxy_ok: bool | None = None     # Clash 代理在运行
     tunnel_ok: bool | None = None    # TUN 已接管流量
     dns_ok: bool | None = None       # DNS 没有泄漏（fake-ip 生效）
-    dns_leak_ip: str | None = None   # DNS 解析出口（检查⑤）；None=未探测/未泄漏
+    # 检查⑤（DNS 出口探针）三态：True=干净 False=泄漏 None=未探测/不可达。
+    # 与 dns_leak_ip 分工：本字段承载判定结果（含不可达），后者只在
+    # 确认泄漏时携带递归出口 IP 供文案展示。
+    dns_egress_ok: bool | None = None
+    dns_leak_ip: str | None = None   # DNS 解析出口（检查⑤）；None=未探测/干净
     probe_ok: bool | None = None     # 出口探测可达
     exit_ip: str | None = None
     in_whitelist: bool | None = None
@@ -50,7 +55,9 @@ def status_line(s: Status) -> str:
     override_min_left 为负数表示“临时放行中但剩余时间未知”，只显示状态。
     """
     if s.paused:
-        return "⏸ 守护已暂停（防火墙保持当前状态）"
+        # 暂停语义 = 冻结在阻断态（fail-closed）：pause 命令会强制
+        # 恢复拦截——文案必须如实（曾写"保持当前状态"与实际矛盾）。
+        return "⏸ 守护已暂停（防火墙保持拦截）"
     if s.override_min_left is not None:
         if s.override_min_left < 0:
             return "⏳ 已临时放行 Claude"
@@ -60,7 +67,7 @@ def status_line(s: Status) -> str:
         # 存在，阻断只是挡住使用；未开 Clash → 风险尚未发生。文案不能断言
         # "无泄漏风险"（曾有 DNS 泄漏态显示该字样自相矛盾，用户实测发现）。
         if s.confirming:
-            return "🛡 防火墙正在拦截（启动确认中，确认通过后自动放行）"
+            return "🛡 防火墙正在拦截（确认中，确认通过后自动放行）"
         return "🛡 防火墙正在拦截 Claude（已阻断风险连接）"
     return "✅ 防火墙已放行 Claude（出口 IP 干净）"
 
@@ -75,12 +82,16 @@ def reason_text(s: Status) -> str:
         return "存在 DNS 泄漏（Claude 域名解析绕过了代理）"
     if s.dns_leak_ip is not None:
         return f"DNS 泄漏（解析出口 {s.dns_leak_ip}，不在白名单）"
+    # 检查⑤探测失败 ≠ 泄漏：显示"无法确认"而不是落到兜底"环境正常"
+    # （拦截态+环境正常的矛盾文案的最后一个残留路径）。
+    if s.dns_egress_ok is None:
+        return "暂时无法确认 DNS 是否泄漏（探测失败，稍后重试）"
     if s.probe_ok is False:
         return "暂时无法确认出口 IP（探测失败，稍后重试）"
     if s.in_whitelist is False:
         return f"出口 IP 不干净（当前出口 {s.exit_ip or '未知'}，不在你的白名单里）"
     if s.confirming:
-        return "检查已通过，正在确认环境稳定（约半分钟内自动放行）"
+        return "检查已通过，正在确认环境稳定（稍后自动放行）"
     return "代理环境正常，出口 IP 在白名单内"
 
 
@@ -98,12 +109,14 @@ def tooltip(s: Status) -> str:
     else:
         head = f"{line1}\n出口 IP：{s.exit_ip or '未知'}"
     # 精简检查行（用 Status 中性字段）："代理✓ TUN✓ 解析✓ 出口✓ DNS✗"
-    # —— 只在 127 字符截断预算内附加，塞不下就不加（完整版看右键"状态详情"）
+    # —— 三态渲染：✓=通过 ✗=未通过 –=未探测（None 显示 – 而非 ✗，
+    # 未探测断言成失败会误导）。DNS 用检查⑤判定（dns_egress_ok），
+    # 不再镜像 fake-ip 结果。塞不下就不加（完整版看右键"状态详情"）。
     pairs = [("代理", s.proxy_ok), ("TUN", s.tunnel_ok),
              ("解析", s.dns_ok), ("出口", s.probe_ok),
-             ("DNS", s.dns_ok if s.dns_leak_ip is None else None)]
-    parts = [f"{label}{'✓' if v else '✗'}" for label, v in pairs]
-    summary = " ".join(parts)
+             ("DNS", s.dns_egress_ok)]
+    parts = [f"{label}{'✓' if v is True else '✗' if v is False else '–'}"
+             for label, v in pairs]
     if len(head) + len(summary) + 1 <= 120:
         return f"{head}\n{summary}"
     return head

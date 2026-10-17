@@ -107,7 +107,10 @@ def transition(state: GateState, event: str) -> Transition:
         if state.state == ALLOWED:
             return Transition(state)  # already allowed; no repeat notify
         # BLOCKED + confirmed N consecutive passes → release (matrix #1).
-        return Transition(GateState(ALLOWED, state.drift_alarm, False),
+        # on_override 保留：override 是外部指令，检查通过只迁移状态；
+        # 到期恢复阻断的承诺（OVERRIDE_EXPIRE 判定依赖该标志）不受
+        # 环境转干净影响（曾因清标志导致到期永不触发、审计缺 end）。
+        return Transition(GateState(ALLOWED, state.drift_alarm, state.on_override),
                           [{"action": DISABLE_FIREWALL},
                            {"action": NOTIFY_ALLOW, "message": "Claude 已放行"}])
 

@@ -235,7 +235,7 @@ def make_guardian(tmp_path, **kw):
     g = Guardian(
         cfg, config_path,
         fw=fw, np=np, dns=dns, ripe=ripe,
-        notify_fn=NOOP, tray=kw.pop("tray", None),
+        notify_fn=kw.pop("notify_fn", NOOP), tray=kw.pop("tray", None),
         clock=clock, sleep_fn=lambda s: None,
         logger=logging.getLogger("test-guard"),
     )
@@ -875,6 +875,14 @@ class TestSelfcheck:
                             lambda host, rng: guardian.dnscheck.FakeIpResult(
                                 ok=True, resolved_ips=("198.18.0.1",),
                                 in_fakeip_range=True))
+        # 检查⑤也必须打桩：真实探针依赖网络/akahelp 可用性（不可达时
+        # 单元测试应仍稳定——selfcheck 语义见 dns_clean 三态）。
+        monkeypatch.setattr(
+            guardian.dnscheck, "check_dns_egress",
+            lambda domain, wl: (guardian.policy.CLEAN,
+                                guardian.dnscheck.DnsEgressResult(
+                                    ok=True, egress_ip="203.0.113.10",
+                                    records=("ns", "203.0.113.10"))))
         cfg = make_config()
         rc = guardian.selfcheck(cfg)
         out = capsys.readouterr().out
@@ -1362,3 +1370,98 @@ class TestFakeipMigrationRefresh:
         g._stop.set()
         g._fakeip_wake.set()
         g._fakeip_thread.join(timeout=5)
+
+
+class TestAuditCopyFixes:
+    """文案-行为一致性审查（三代理全盘审查）修复的回归保护。"""
+
+    def test_check_pass_preserves_override(self):
+        """CHECK_PASS 保留 on_override：override 中环境转干净，到期
+        恢复阻断的承诺仍生效（曾清标志导致到期永不触发、审计缺 end）。"""
+        st = sm.GateState(sm.BLOCKED, on_override=True)
+        tr = sm.transition(st, sm.CHECK_PASS)
+        assert tr.new_state.state == sm.ALLOWED
+        assert tr.new_state.on_override is True
+
+    def test_pause_ends_override_and_freezes(self, tmp_path):
+        """暂停时结束 override：on_override=False + 审计补记 end（防 heal
+        线程按 override 期望反向放行规则，与"冻结阻断"矛盾）。"""
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        g.handle_command("override_30min")
+        assert g._gstate.on_override is True
+        g.handle_command("toggle_pause")
+        assert g.paused is True
+        assert g._gstate.on_override is False
+        assert g.override_until is None
+        audit = tmp_path / "logs" / "override-audit.log"
+        assert "end pause" in audit.read_text(encoding="utf-8")
+
+    def test_heal_expected_enabled_when_paused(self, tmp_path):
+        """暂停期间 heal 线程期望恒为 Enabled（冻结阻断）。"""
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        g.handle_command("override_30min")  # 正常情况期望 Disabled
+        g.paused = True                     # 暂停后期望必须翻转为 Enabled
+        g._self_heal_rules()
+        assert fw.global_enabled is True
+
+    def test_override_expire_toast_uses_end_copy(self, tmp_path):
+        """override 到期 Toast 用专属文案"临时放行已结束"（曾走通用
+        阻断文案+出口误报"不在白名单"）。"""
+        toasts = []
+        g, fw, *_ , _ = make_guardian(
+            tmp_path, notify_fn=lambda t, b: toasts.append((t, b)))
+        g.handle_command("override_30min")
+        g.handle_command("end_override")
+        assert any("临时放行已结束" in b for _, b in toasts)
+
+    def test_block_toast_no_false_dirty_when_echo_clean(self, tmp_path):
+        """阻断 Toast 不对白名单内出口误报"不在白名单"（曾强制置脏：
+        DNS 不可达升级阻断时对干净出口弹"出口 IP 不干净"）。"""
+        from core import messages as msgs
+        # DNS 探针不可达（连续升级阻断）但出口干净
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        g._last_checks = {
+            "mihomo进程": True, "TUN网卡": True, "fake-ip": True,
+            "echo出口": True, "DNS出口干净": None,  # 不可达（三态）
+        }
+        g._last_echo_ip = "203.0.113.10"
+        g._last_echo_in_whitelist = True
+        title, body = g._toast_text(guardian.sm.NOTIFY_BLOCK)
+        assert "不在你的白名单里" not in body
+        assert "暂时无法确认" in body
+
+    def test_push_tray_no_dns_ip_when_clean(self, tmp_path):
+        """CLEAN 态 dns_leak_ip 必须为 None（详情窗曾显示递归出口 IP
+        被读成泄漏，同屏"DNS出口干净: 通过"自相矛盾）。"""
+        class _Sink:
+            def __init__(self): self.events = []
+            def push_event(self, evt): self.events.append(evt)
+        sink = _Sink()
+        g, fw, *_ , _ = make_guardian(tmp_path, tray=sink)
+        g._last_checks = {"mihomo进程": True, "TUN网卡": True, "fake-ip": True,
+                          "echo出口": True, "DNS出口干净": True}
+        g._last_dns_ip = "198.51.100.20"  # 慢路径每轮无条件赋值过
+        g._last_echo_ip = "203.0.113.10"
+        g._last_echo_in_whitelist = True
+        g._push_tray()
+        evt = sink.events[-1]
+        assert evt.dns_leak_ip is None
+        # whitelist_hit 三态直传（None=未探测，由 tray 显示"未探测"）
+        assert evt.whitelist_hit is True
+
+    def test_whitelist_hit_none_shows_unprobed(self):
+        """白名单命中未探测显示"未探测"，不断言"否"。"""
+        from tray import State, StateEvent
+        evt = StateEvent(state=State.BLOCKED, whitelist_hit=None,
+                         checks={"mihomo进程": True})
+        lines = evt.detail_lines()
+        assert any(ln == "白名单命中: 未探测" for ln in lines)
+
+    def test_fast_fail_records_real_values(self, tmp_path):
+        """fast-fail 快照按真实结果记录（曾硬编码双 False：只挂 TUN 时
+        mihomo 被误报未运行）。"""
+        np = FakeNetprobe(mihomo=True, tun=False)
+        g, fw, *_ , _ = make_guardian(tmp_path, np=np)
+        g.tick()
+        assert g._last_checks["mihomo进程"] is True
+        assert g._last_checks["TUN网卡"] is False

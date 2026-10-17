@@ -41,18 +41,20 @@ def _frozen_check() -> int:
         _message_box("Claude Guard 自检失败",
                      f"配置错误：{exc}\n\n路径: {config_path}", error=True)
         return 2
+    # 图标自检也收进 redirect_stdout：windowed exe 下 stdout 无控制台，
+    # with 外的 print 不可见（失败原因曾到不了 MessageBox，只剩错误图标）。
     with redirect_stdout(buf):
         code = selfcheck(config)
-    # 图标资源自检：三张图标必须能从 _MEIPASS/assets 加载（技术细节，附在末尾）
-    icons_ok = True
-    for color in ("green", "red", "yellow"):
-        p = icon_file(color)
-        if not p.is_file():
-            icons_ok = False
-            print(f"图标资源缺失: {p}")
-    if not icons_ok:
-        code = 3
-        print("图标资源自检: 失败")
+        # 图标资源自检：三张图标必须能从 _MEIPASS/assets 加载（技术细节，附在末尾）
+        icons_ok = True
+        for color in ("green", "red", "yellow"):
+            p = icon_file(color)
+            if not p.is_file():
+                icons_ok = False
+                print(f"图标资源缺失: {p}")
+        if not icons_ok:
+            code = 3
+            print("图标资源自检: 失败")
     _message_box("Claude Guard 自检结果", buf.getvalue(), error=code != 0)
     return code
 

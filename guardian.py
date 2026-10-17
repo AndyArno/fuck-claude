@@ -294,8 +294,11 @@ class Guardian:
         fast_ok = local.mihomo_running and local.tun_present
         if not fast_ok:
             event = sm.FAST_FAIL
+            # 按真实结果记录（曾硬编码双 False：只挂 TUN 时 mihomo 也
+            # 被报"未运行"，首行原因错报"Clash 代理没有在运行"）。
             self._last_checks = {
-                "mihomo进程": False, "TUN网卡": False,
+                "mihomo进程": bool(local.mihomo_running),
+                "TUN网卡": bool(local.tun_present),
                 "fake-ip": None, "echo出口": None,
             }
         elif self._tick_count == 1 or self._tick_count % self._slow_every == 0:
@@ -385,7 +388,11 @@ class Guardian:
             "TUN网卡": bool(local.tun_present),
             "fake-ip": bool(fakeip_ok),
             "echo出口": bool(echo.ok),
-            "DNS出口干净": dns_verdict == policy.CLEAN,
+            # 三态：True=干净 False=泄漏 None=探测不可达（akahelp 失联
+            # ≠泄漏，曾映射成 False 被显示为"未通过"误导）。
+            "DNS出口干净": (True if dns_verdict == policy.CLEAN
+                            else False if dns_verdict == policy.DIRTY
+                            else None),
         }
         self.log.info(
             "慢路径：echo=%s fakeip=%s dns=%s verdict=%s",
@@ -484,13 +491,17 @@ class Guardian:
             elif act == sm.DISABLE_FIREWALL:
                 self._fw_tolerant("set_blocking", False)
             elif act in (sm.NOTIFY_BLOCK, sm.NOTIFY_ALLOW, sm.NOTIFY_ALERT):
-                title, body = self._toast_text(act)
+                title, body = self._toast_text(act, a.get("message"))
                 self._notify(title, body)
             else:  # pragma: no cover - 状态机之外的指令
                 self.log.warning("未知 action: %r", a)
 
-    def _toast_text(self, act: str) -> tuple[str, str]:
-        """状态切换 Toast 文案，统一从 core.messages 取（用户可见面）。"""
+    def _toast_text(self, act: str, message: str | None = None) -> tuple[str, str]:
+        """状态切换 Toast 文案，统一从 core.messages 取（用户可见面）。
+
+        message 为状态机 action 携带的中性标记（如"临时放行结束"）：
+        计划内的 override 到期走专属文案，避免把"复检恢复"误报成
+        新发生的风险阻断（曾叠加出口误报"不在白名单"）。"""
         if act == sm.NOTIFY_ALLOW:
             # 临时放行开始的放行动作 ≠ 出口干净：override 语境用专属文案
             # （曾误报"出口 IP 干净"误导用户，实测发现）。
@@ -499,6 +510,8 @@ class Guardian:
             return messages.toast_allow()
         if act == sm.NOTIFY_ALERT:
             return messages.toast_drift()
+        if act == sm.NOTIFY_BLOCK and message == "临时放行结束":
+            return messages.toast_override_end()
         # NOTIFY_BLOCK：拦截态附大白话原因。
         # 排除法：快/慢检查里 proxy/tunnel/dns 任一失败即按该项解释；
         # 否则若看到了出口 IP，说明 CHECK_FAIL 由“出口不在白名单”触发；
@@ -517,11 +530,16 @@ class Guardian:
         echo_dirty = seen_ip and self._last_echo_in_whitelist is False
         if dns_leak and not echo_dirty:
             return messages.toast_block(
-                messages.Status(dns_leak_ip=self._last_dns_ip, **base))
+                messages.Status(
+                    dns_egress_ok=False,
+                    dns_leak_ip=self._last_dns_ip, **base))
         s = messages.Status(
             probe_ok=False if local.get("echo出口") is False else (None if not seen_ip else True),
             exit_ip=self._last_echo_ip,
-            in_whitelist=False if seen_ip else None,
+            # 真实白名单判定（曾强制置 False：DNS 探针不可达升级阻断/
+            # override 到期时，对白名单内出口误报"不在白名单"）。
+            in_whitelist=self._last_echo_in_whitelist,
+            dns_egress_ok=local.get("DNS出口干净"),
             **base,
         )
         return messages.toast_block(s)
@@ -622,7 +640,9 @@ class Guardian:
         PowerShell 调用持 _fw_lock，与主循环的 enable/disable 按次互斥。
         get_status / ensure_enabled_v6 为只读/幂等校验，裸调用后整体关闭，
         保证读取与写入的规则状态一致。"""
-        expected_enabled = not (
+        # 暂停 = 冻结阻断：期望恒为 Enabled（heal 线程与暂停语义对齐，
+        # 防 override 残留标志导致 heal 反向放行规则）。
+        expected_enabled = self.paused or not (
             self._gstate.state == sm.ALLOWED or self._gstate.on_override
         )
         try:
@@ -739,11 +759,18 @@ class Guardian:
             if want_pause and not self.paused:
                 self.paused = True
                 self._counter.reset()
+                # 暂停中 override 与"冻结阻断"矛盾（heal 线程会按
+                # on_override 期望把规则改回放行）→ 暂停时同时结束
+                # override（审计补记 end，与手动结束同格式）。
+                if self._gstate.on_override:
+                    self.override_until = None
+                    self._log_audit("end pause")
+                    self.log.info("暂停期间 Override 一并结束（冻结阻断）")
                 # 暂停语义 = 冻结在阻断态（fail-closed，安全优先）：
                 # 强制 enable 规则，即使暂停前处于放行态/override。
                 self._fw_tolerant("set_blocking", True)
                 self._gstate = sm.GateState(
-                    sm.BLOCKED, self._gstate.drift_alarm, self._gstate.on_override)
+                    sm.BLOCKED, self._gstate.drift_alarm, False)
                 self.log.info("守护已暂停（规则冻结在阻断态，不执行检查）")
                 self._notify(*messages.toast_paused())
             elif not want_pause and self.paused:
@@ -973,22 +1000,36 @@ class Guardian:
                 sm.BLOCKED: State.BLOCKED,
                 sm.ALLOWED: State.ALLOWED,
             }
+            # 临时放行剩余分钟：guardian 手里有 override_until，算出来
+            # 送达托盘（status_line 支持分钟展示但此前恒传 -1 死分支）。
+            override_min = None
+            if self._gstate.on_override and self.override_until is not None:
+                override_min = max(
+                    0, int((self.override_until - self._clock()) // 60))
             evt = StateEvent(
+                override_minutes=int(self.config.override_minutes),
                 state=state_map[self._gstate.state],
                 exit_ip=self._last_echo_ip or "未知",
-                # 白名单命中 = 上次慢路径的真实判定；从未探测过（None）
-                # 显示未命中。曾误用 bool(_last_echo_ip)：只要探到过出口
-                # IP 就显示"是"，出口变脏时也错报"命中"（用户实测发现）。
-                whitelist_hit=self._last_echo_in_whitelist is True,
-                dns_leak_ip=self._last_dns_ip,
+                # 白名单命中 = 上次慢路径的真实三态判定（None=未探测，
+                # 由 tray 显示"未探测"而非断言"否"——曾折叠成 False 误导）。
+                whitelist_hit=self._last_echo_in_whitelist,
+                # DNS 解析出口只在确认泄漏时携带（CLEAN 态详情窗曾显示
+                # 递归出口 IP 被读成泄漏，同屏"DNS出口干净: 通过"自相矛盾）。
+                dns_leak_ip=(self._last_dns_ip
+                             if self._last_checks.get("DNS出口干净") is False
+                             else None),
                 checks=dict(self._last_checks),
                 paused=self.paused,
                 drift=self._gstate.drift_alarm,
                 override_active=self._gstate.on_override,
-                # 启动确认期：仍在拦截但检查已全部通过（等待连续确认放行）
+                override_min_left=override_min,
+                # 确认中：拦截但检查全过 **且出口判定在白名单**（曾缺白
+                # 名单条件——出口脏时确认窗永不可能通过，却持续显示
+                # "确认通过后自动放行"自相矛盾）。
                 confirming=(self._gstate.state == sm.BLOCKED
                             and bool(self._last_checks)
-                            and all(v for v in self._last_checks.values())),
+                            and all(v for v in self._last_checks.values())
+                            and self._last_echo_in_whitelist is True),
             )
             self.tray.push_event(evt)
         except Exception as exc:
@@ -1048,29 +1089,41 @@ def selfcheck(config: Config, logger: logging.Logger | None = None) -> int:
         config.dns_probe_domain,
         list(config.dns_whitelist or config.whitelist))
     dns_leak_ip = dns_probe.egress_ip if dns_probe.ok else None
-    results["DNS出口干净"] = dns_verdict == policy.CLEAN
+    # 三态：True=干净 False=泄漏 None=探测不可达（不可达≠泄漏，
+    # 曾映射成 False 被显示为"未通过"）。
+    dns_clean = (True if dns_verdict == policy.CLEAN
+                 else False if dns_verdict == policy.DIRTY else None)
+    results["DNS出口干净"] = dns_clean
 
     # ---- 主结论（第一行防火墙状态 + 大白话原因）----
-    # 主结论看全量检查：echo 判定 DIRTY 也算“防火墙应当拦截”（排除法：
-    # 其余各项都正常时，不干净只能来自出口 IP 不在白名单）。
-    # 检查⑤ DNS 出口脏同权：akamai whoami 递归出口不在白名单 → 同样阻断。
-    everything_else_ok = mihomo and tun_ok and fk_ok
-    should_block = not fast_ok or (
-        echo_ok is not None and in_whitelist is False and everything_else_ok
-    ) or (
-        dns_verdict == policy.DIRTY and everything_else_ok
-    )
+    # 与 Guardian 真实判定链对齐（曾用单独近似公式：缺 fake-ip 项，
+    # fake-ip 失效时显示"已放行+DNS 泄漏"矛盾并掩盖真实出口泄漏）：
+    #   local_ok（①②③）失败 → 应阻断（同 evaluate 的 BLOCK_NOW 语义）
+    #   echo 出口脏 / DNS 泄漏 → 应阻断（同 G-4）
+    #   echo/DNS 不可达 → 显示"无法确认"，不下"已放行"断言
+    local_ok = mihomo and tun_ok and fk_ok
+    echo_dirty = echo_ok is True and in_whitelist is False
+    should_block = not local_ok or echo_dirty or dns_clean is False
     status = messages.Status(
         blocking=should_block,
         proxy_ok=mihomo,
         tunnel_ok=tun_ok,
         dns_ok=fk_ok,
-        dns_leak_ip=dns_leak_ip if dns_verdict == policy.DIRTY else None,
+        dns_egress_ok=dns_clean,
+        dns_leak_ip=dns_leak_ip if dns_clean is False else None,
         probe_ok=echo_ok,
         exit_ip=exit_ip,
         in_whitelist=in_whitelist,
     )
-    print(messages.status_line(status))
+    # 探测不可达（echo 或 DNS）时不下"已放行（出口 IP 干净）"断言：
+    # 自检是单轮快照，不等于确认窗口已通过（托盘侧放行需 3 连 CLEAN）。
+    unconfirmed = (not should_block
+                   and (echo_ok is None or dns_clean is None))
+    if unconfirmed:
+        print("⏳ 当前检查未见异常，但探测未全部成功，"
+              "未能确认是否可以放行（以托盘实际状态为准）")
+    else:
+        print(messages.status_line(status))
     print(messages.reason_line(status))
     if not should_block:
         print("（自检为只读探测，不改变防火墙当前状态）")
@@ -1091,20 +1144,31 @@ def selfcheck(config: Config, logger: logging.Logger | None = None) -> int:
           f"{list(fakeips) or '空（Clash 未运行或返回真实 IP）'}")
     try:
         fw_status = fw_mod.get_status_fakeip(config)
-        print(f"    规则 {config.rule_name_fakeip}: {fw_status}")
+        # 内部枚举文字化（技术区同为用户可见面，统一中文三态）
+        fw_status_txt = {"ENABLED": "启用中", "DISABLED": "已停用",
+                         "MISSING": "不存在"}.get(
+            str(fw_status).upper(), str(fw_status))
+        print(f"    规则 {config.rule_name_fakeip}: {fw_status_txt}")
     except Exception as exc:
         print(f"    规则 {config.rule_name_fakeip}: 查询失败（{exc}）")
     if echo.ok:
         verdict = policy.classify(echo.ip, list(config.whitelist))
-        print(f"④ echo 出口 IP: {echo.ip}（{echo.endpoint}）→ 白名单判定: {verdict}")
+        verdict_txt = {policy.CLEAN: "干净",
+                       policy.DIRTY: "不在白名单",
+                       policy.UNREACHABLE: "未探测"}.get(verdict, verdict)
+        print(f"④ echo 出口 IP: {echo.ip}（{echo.endpoint}）→ 白名单判定: {verdict_txt}")
     else:
         print(f"④ echo 出口 IP: 不可达（{echo.error}）")
+    dns_txt = {policy.CLEAN: "干净", policy.DIRTY: "泄漏",
+               policy.UNREACHABLE: "未探测"}.get(dns_verdict, dns_verdict)
     print(f"⑤ DNS 出口探针 ({config.dns_probe_domain}): "
-          f"判定={dns_verdict} 解析出口={dns_probe.egress_ip or '未知'}"
+          f"判定={dns_txt} 解析出口={dns_probe.egress_ip or '未知'}"
           + (f" records={dns_probe.records}" if dns_probe.records else "")
           + (f" error={dns_probe.error}" if dns_probe.error else ""))
     print(f"\n快路径判定: {'正常' if fast_ok else '失败（将立即阻断）'}")
     readable = {k: {True: "通过", False: "未通过"}.get(v, "未探测")
                 for k, v in results.items()}
     print(f"五项检查: {readable}")
-    return 0 if fast_ok else 1
+    # 退出码：应阻断（含 fake-ip 失效等 local 检查失败、出口/DNS 脏）
+    # 才非零（曾只看 fast_ok，掩盖 fake-ip 失效与真实泄漏）。
+    return 0 if not should_block else 1

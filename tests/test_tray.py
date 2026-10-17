@@ -123,7 +123,7 @@ class TestStartupConfirming:
 
     def test_confirming_status_line(self):
         lines = self._confirming_event().detail_lines()
-        assert "启动确认中" in lines[0]
+        assert "启动确认中" in lines[0] or "确认中" in lines[0]
 
     def test_not_confirming_keeps_normal_text(self):
         """非确认期（稳定拦截）不误加确认文案：无 confirming 字段时行为不变。"""

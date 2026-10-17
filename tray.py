@@ -56,15 +56,19 @@ class StateEvent:
 
     state: State
     exit_ip: str = "未知"
-    whitelist_hit: bool = False
-    # 检查⑤ DNS 出口探针看到的解析出口 IP（None=未探测/干净）
+    # 白名单命中三态：True=命中 False=不在白名单 None=未探测
+    whitelist_hit: bool | None = None
+    # 检查⑤ DNS 出口探针看到的解析出口 IP（仅确认泄漏时携带）
     dns_leak_ip: str | None = None
-    # 检查结果：名称 -> bool（True=通过 False=失败）
+    # 检查结果：名称 -> True/False/None（None=未探测）
     checks: dict = field(default_factory=dict)
     paused: bool = False
     drift: bool = False
     override_active: bool = False
-    # 启动确认期：拦截中但检查已全过（等待连续确认），文案显示"确认中"
+    # 临时放行剩余分钟（None=非 override）；-1 保留为"未知"哨兵
+    override_min_left: int | None = None
+    # 临时放行总时长（分钟，来自配置；菜单文案用，曾硬编码 30）
+    override_minutes: int = 30
     confirming: bool = False
 
     def _status(self) -> Status:
@@ -73,11 +77,14 @@ class StateEvent:
         return Status(
             blocking=self.state is State.BLOCKED,
             paused=self.paused,
-            override_min_left=(-1 if self.override_active else None),
+            override_min_left=(self.override_min_left
+                               if self.override_min_left is not None
+                               else (-1 if self.override_active else None)),
             confirming=self.confirming,
             proxy_ok=c.get("mihomo进程"),
             tunnel_ok=c.get("TUN网卡"),
             dns_ok=c.get("fake-ip"),
+            dns_egress_ok=c.get("DNS出口干净"),
             dns_leak_ip=dns_leak,
             probe_ok=c.get("echo出口"),
             exit_ip=self.exit_ip,
@@ -88,6 +95,10 @@ class StateEvent:
         if self.drift:
             return "yellow"
         if self.paused:
+            return "yellow"
+        # 临时放行 = 规则已放行（计划内）：红图标会与"流量实际放行"
+        # 矛盾，用黄色提示"非常规状态"
+        if self.override_active:
             return "yellow"
         return {
             State.BLOCKED: "red",
@@ -111,7 +122,9 @@ class StateEvent:
                      + ("（已暂停）" if self.paused else "")
                      + ("（临时放行中）" if self.override_active else ""))
         lines.append(f"出口 IP: {self.exit_ip}")
-        lines.append(f"白名单命中: {'是' if self.whitelist_hit else '否'}")
+        # 三态：未探测不断言"否"（用户会读成"被查过且不在白名单"）
+        hit_txt = {True: "是", False: "否"}.get(self.whitelist_hit, "未探测")
+        lines.append(f"白名单命中: {hit_txt}")
         if self.dns_leak_ip:
             lines.append(f"DNS 解析出口: {self.dns_leak_ip}")
         for name, result in self.checks.items():
@@ -216,6 +229,14 @@ class Tray:
     def _on_override(self) -> bool:
         return bool(self._last_event and self._last_event.override_active)
 
+    def _override_label(self) -> str:
+        """临时放行菜单文案：分钟数取 guardian 送达的配置值（曾硬编码
+        "30 分钟"，用户改 override_minutes 后菜单与实际时长不符）。"""
+        minutes = 30
+        if self._last_event is not None:
+            minutes = self._last_event.override_minutes
+        return f"临时放行 {minutes} 分钟"
+
     def _build_menu(self) -> pystray.Menu:
         """动态菜单：visible/checked 接 callable，pystray 打开菜单时求值；
         状态变化时 _apply 里 update_menu() 重建，保证与守护状态一致。"""
@@ -224,7 +245,7 @@ class Tray:
                 "状态详情", self._show_details, default=True
             ),
             pystray.MenuItem(
-                "临时放行 30 分钟",
+                self._override_label(),
                 self._menu_cb(Command.OVERRIDE_30MIN),
                 # 已在临时放行中 → 置灰防重复点击
                 enabled=lambda item: not self._on_override(),
