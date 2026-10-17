@@ -309,9 +309,14 @@ def block_all(config: Config, fakeip_ips: list[str] | None = None) -> None:
     remote1 = _ps_array(list(config.blocked_cidrs_v4))
     # P2-9（PS 回退路径）：CG-FakeIP 存在即无条件 Enable（fail-closed，
     # 不依赖 fakeip_ips 是否已知）；缺失且 fakeip_ips 非空才重建。
-    # fakeip_ips 为空时仍对已存在的 CG-FakeIP 执行 Enable（n2 Enable 段
-    # 恒在），只是没有 New-NetFirewallRule 重建段。
-    enable2 = f"Enable-NetFirewallRule -DisplayName {n2} -ErrorAction Stop; "
+    # Enable 必须带存在性守卫：Enable-NetFirewallRule 对缺失名带
+    # -ErrorAction Stop 是终止错误（实测 rc=1），fakeip_ips 为空且
+    # CG-FakeIP 不存在时会把整个脚本打死——CG-Global 已启用但复查段
+    # 执行不到，block_all 误报失败、_fw_tolerant 白重试 3 次。
+    enable2 = (
+        f"if (Get-NetFirewallRule -DisplayName {n2} -ErrorAction SilentlyContinue)"
+        f" {{ Enable-NetFirewallRule -DisplayName {n2} -ErrorAction Stop; }}; "
+    )
     fakeip_part = enable2
     if fakeip_ips:
         remote2 = _ps_array(list(fakeip_ips))

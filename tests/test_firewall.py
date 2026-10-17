@@ -533,3 +533,15 @@ class TestBlockAllPsScriptShape:
                             lambda s: captured.append(s) or "True\nTrue\n")
         fw.block_all(self._cfg(), ["198.18.0.1"])
         assert "-Protocol" not in captured[0]
+
+    def test_enable_n2_is_existence_guarded(self, monkeypatch):
+        """核验回归：Enable n2 必须带存在性守卫——对缺失名带 Stop 是
+        终止错误（实测 rc=1），无守卫时 CG-FakeIP 缺失会把整脚本打死，
+        CG-Global 已启用但复查段执行不到、block_all 误报失败。"""
+        captured = []
+        monkeypatch.setattr(fw, "_netsh_set_enabled", lambda n, e: False)
+        monkeypatch.setattr(fw, "_run_ps",
+                            lambda s: captured.append(s) or "True\n")
+        fw.block_all(self._cfg(), None)
+        assert ("if (Get-NetFirewallRule -DisplayName 'CG-FakeIP'"
+                in captured[0])
