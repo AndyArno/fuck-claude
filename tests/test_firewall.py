@@ -426,7 +426,7 @@ class TestEnsureEnabledV6Offline:
 
 
 class TestRunPsErrorClassification:
-    """P2-14（B 侧）：_run_ps rc≠0 分类与 _dec UTF-8→mbcs 回退。
+    """P2-14（B 侧）：_run_ps rc≠0 分类与 _dec UTF-8→GBK 回退。
     全部 monkeypatch subprocess.run，零真实子进程。"""
 
     def _cfg_module_run(self, monkeypatch, returncode, stdout=b"", stderr=b""):
@@ -478,11 +478,11 @@ class TestRunPsErrorClassification:
         assert "-NoProfile" in cmd and "-NonInteractive" in cmd
         assert kw.get("creationflags") == fw.subprocess.CREATE_NO_WINDOW
 
-    def test_dec_utf8_then_mbcs_fallback(self, monkeypatch):
-        """UTF-8 可解码原样输出；非法 UTF-8 回退 mbcs（GBK）。"""
+    def test_dec_utf8_then_gbk_fallback(self, monkeypatch):
+        """UTF-8 可解码原样输出；非法 UTF-8 回退 GBK（不随系统 locale 漂移）。"""
         self._cfg_module_run(monkeypatch, 0, stdout=b"ok\n")
         assert fw._run_ps("'ok'") == "ok"
-        # GBK 编码的中文（非法 UTF-8 序列）→ mbcs 兜底正确还原
+        # GBK 编码的中文（非法 UTF-8 序列）→ GBK 兜底正确还原
         self._cfg_module_run(
             monkeypatch, 0, stdout="拒绝访问".encode("gbk"))
         assert "拒绝访问" in fw._run_ps("'拒绝访问'")

@@ -1787,8 +1787,18 @@ class TestFakeipMigrationRefresh:
             g._fakeip_wake.set()
             g._fakeip_thread.join(timeout=5)
 
-    def test_transition_wake_immediately_not_slow_tick(self, tmp_path):
+    def test_transition_wake_immediately_not_slow_tick(self, tmp_path,
+                                                       monkeypatch):
         """迁移触发即刷新：不再依赖 _tick_count 到慢路径轮次。"""
+        import socket as s
+
+        # 打桩 fake-ip 解析：真实 getaddrinfo 依赖 mihomo fake-ip 环境——
+        # 无 fake-ip 的机器（CI）解析出真实 IP 会被 collect_fakeips 过滤成
+        # 空集，刷新线程"保持现状"不重建，测试恒超时（本机环境依赖 bug）。
+        monkeypatch.setattr(
+            s, "getaddrinfo",
+            lambda host, *a, **k: [(2, 1, 6, "", ("198.18.0.7", 0))])
+
         np = FakeNetprobe(echo_ip="203.0.113.9")  # 白名单外 → DIRTY
         g, fw, *_ , _ = make_guardian(tmp_path, np=np)
         g._gstate = sm.GateState(state=sm.ALLOWED)
@@ -1796,6 +1806,7 @@ class TestFakeipMigrationRefresh:
         before = fw.calls.count("create_rule_fakeip")
         g._tick_count = 0  # 本轮慢路径不跑（% 5 != 0），只靠迁移唤醒
         # 慢路径刷新未跑，规则内集合还是旧值 → 唤醒线程必须自己重采集
+        g._fakeip_rule_ips = ("198.18.0.1",)  # 旧集合 ≠ 新采集 → 必触发重建
         g._fakeip_thread = threading.Thread(
             target=g._fakeip_refresh_loop, name="fakeip-refresh", daemon=True)
         g._fakeip_thread.start()

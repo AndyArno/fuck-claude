@@ -58,7 +58,7 @@ main.py / scripts/run_guardian.py   打包入口 / 开发态入口（共用 main
 
 ## 环境事实（开发前提，勿凭空假设）
 
-- 目标机：Windows 11 x64，中文系统（PS 输出 GBK——`_run_ps` 已做 UTF-8/mbcs 双解码）
+- 目标机：Windows 11 x64，中文系统（PS 输出 GBK——`_run_ps` 已做 UTF-8/GBK 双解码）
 - 代理：Clash Verge + verge-mihomo.exe，TUN + fake-ip（198.18.0.0/15），
   **clash_verge_service 服务会 3 秒内复活被杀的内核**——测"关 Clash"场景必须先 Stop-Service，
   测完恢复（用户会被弹"需要更新系统服务"打扰，测试前告知）

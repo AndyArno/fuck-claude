@@ -73,12 +73,15 @@ def _ps_array(values: list[str]) -> str:
 
 
 def _decode_console(data: bytes) -> str:
-    """子进程控制台输出解码：编码随系统 locale（中文系统为 GBK），
-    UTF-8 优先、mbcs 兜底（PS 与 netsh 共用）。"""
+    """子进程控制台输出解码：UTF-8 优先、GBK 兜底（PS 与 netsh 共用）。
+
+    兜底用显式 GBK 而非 mbcs：目标机是中文 Windows（ANSI 代码页 936，
+    mbcs==GBK，两者等价），但 mbcs 随系统区域设置漂移——en-US 机器
+    mbcs=cp1252，GBK 字节会解成乱码（CI 实测）。"""
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError:
-        return data.decode("mbcs", "replace")
+        return data.decode("gbk", "replace")
 
 
 def _run_ps(script: str) -> str:
