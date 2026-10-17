@@ -74,7 +74,7 @@ main.py / scripts/run_guardian.py   打包入口 / 开发态入口（共用 main
 # 环境（已建）
 .venv/Scripts/python -m pip install -r requirements.txt   # 版本全部锁定
 
-# 测试（改任何代码后必跑；当前 288 passed）
+# 测试（改任何代码后必跑；当前 327 passed）
 .venv/Scripts/python -m pytest tests/ -q
 
 # 自检（只读，不碰防火墙；实机验证的第一手段）
