@@ -46,6 +46,16 @@ class FakeFirewall:
     def fail_on(self, method: str) -> bool:
         return method in self.fail_methods
 
+    # 启动预热 netsh 探测：默认 None（探测失败）→ guardian 回退原 PS 路径，
+    # 既有用例行为不变；快进路径用例通过 probe_override 注入快照。
+    def probe_rule_netsh(self, display_name):
+        return getattr(self, "probe_override", None) and self.probe_override(display_name)
+
+    @staticmethod
+    def normalize_addr_set(values):
+        from winplat import firewall as _fw_mod
+        return _fw_mod.normalize_addr_set(values)
+
     def create_rule(self, config) -> None:
         self.calls.append("create_rule")
         self.threaded_calls.append(("create_rule", threading.current_thread().name))
@@ -941,11 +951,78 @@ class TestPreheat:
         """启动初态恒 BLOCKED：即使 Guardian 状态字段默认值异常，preheat
         也无条件置阻断（P2-7 验收：pause/ALLOWED 初始态不影响）。"""
         fw = FakeFirewall(global_enabled=False)
-        g, *_ , _ = make_guardian(tmp_path, fw=fw)
+        g, *_ = make_guardian(tmp_path, fw=fw)
         g._gstate = sm.GateState(state=sm.ALLOWED)  # 残留期望 Disabled
         g._preheat = Guardian._preheat.__get__(g)
         g._preheat()
         assert fw.global_enabled is True   # 启动期无条件阻断
+
+
+class TestPreheatNetshFastPath:
+    """启动预热 netsh 快进：探测到规则已就绪则零 PS；不符/缺失回退 PS。"""
+
+    @staticmethod
+    def _make_probe(fw, *, g_enabled=True, g_ips=("160.79.104.0/23",),
+                    v6_ok=True, fakeip_ips=("198.18.0.1/32",)):
+        from winplat.firewall import NetshRuleInfo, normalize_addr_set
+        table = {
+            "CG-Global": NetshRuleInfo(True, g_enabled, normalize_addr_set(g_ips)),
+            "CG-V6": (NetshRuleInfo(True, True, normalize_addr_set(["2607:6bc0::/48"]))
+                      if v6_ok else None),
+            "CG-FakeIP": NetshRuleInfo(True, True, normalize_addr_set(fakeip_ips)),
+        }
+        fw.probe_override = table.get
+
+    @staticmethod
+    def _run(g):
+        g._preheat = Guardian._preheat.__get__(g)
+        import socket as s
+        real = s.getaddrinfo
+        s.getaddrinfo = lambda h, *a, **k: [(2, 1, 6, "", ("198.18.0.1", 0))]
+        try:
+            g._preheat()
+        finally:
+            s.getaddrinfo = real
+
+    def test_all_ready_zero_ps(self, tmp_path):
+        """三规则存在且状态/地址一致 → 预热零 PS 调用（~9.6s → ~0.5s 的来源）。"""
+        fw = FakeFirewall()
+        self._make_probe(fw)
+        g, fw, *_ = make_guardian(tmp_path, fw=fw)
+        self._run(g)
+        assert fw.calls == []
+        assert g._fakeip_rule_ips == ("198.18.0.1",)
+
+    def test_global_leftover_disabled_fast_blocks(self, tmp_path):
+        """CG-Global 残留放行态（强杀场景）→ 仅一次 set_blocking(True)
+        （生产内置 netsh 快车道 ~0.4s），不走 ensure_exists 全量 PS。"""
+        fw = FakeFirewall(global_enabled=False)
+        self._make_probe(fw, g_enabled=False)
+        g, fw, *_ = make_guardian(tmp_path, fw=fw)
+        self._run(g)
+        assert fw.calls == ["set_blocking_on"]
+        assert fw.global_enabled is True
+
+    def test_global_addr_mismatch_rebuilds(self, tmp_path):
+        """地址集与配置不符（升级改 CIDR）→ 覆盖重建（ensure_exists 按名
+        存在不动作，堵不住新段）+ 封死。"""
+        fw = FakeFirewall()
+        self._make_probe(fw, g_ips=("203.0.113.0/24",))  # 与配置 160.79.104.0/23 不符
+        g, fw, *_ = make_guardian(tmp_path, fw=fw)
+        self._run(g)
+        assert fw.calls[:2] == ["create_rule", "set_blocking_on"]
+
+    def test_probe_failure_falls_back_to_ps(self, tmp_path):
+        """探测失败（None）→ 完整回退原 PS 路径（不确定就走权威路径）。"""
+        fw = FakeFirewall(global_enabled=False)
+        # probe_override 不设置 → probe_rule_netsh 返回 None
+        g, fw, *_ = make_guardian(tmp_path, fw=fw)
+        self._run(g)
+        assert "ensure_exists" in fw.calls
+        assert "set_blocking_on" in fw.calls
+        assert "ensure_enabled_v6" in fw.calls
+        assert "create_rule_fakeip" in fw.calls
+        assert fw.global_enabled is True
 
 
 # ----------------------------------------------------------------- P2-5 tick 内零 PS

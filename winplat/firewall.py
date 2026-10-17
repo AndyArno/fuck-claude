@@ -11,9 +11,11 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import subprocess
 import sys
+from dataclasses import dataclass
 
 if __package__ in (None, ""):
     Config = object  # 允许独立运行/冒烟时鸭子类型（只需属性 rule_name_*/blocked_cidrs_*）
@@ -70,6 +72,15 @@ def _ps_array(values: list[str]) -> str:
     return "@(" + ",".join(_ps_quote(v) for v in values) + ")"
 
 
+def _decode_console(data: bytes) -> str:
+    """子进程控制台输出解码：编码随系统 locale（中文系统为 GBK），
+    UTF-8 优先、mbcs 兜底（PS 与 netsh 共用）。"""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("mbcs", "replace")
+
+
 def _run_ps(script: str) -> str:
     """执行一段 PowerShell 脚本，返回 stdout。权限/超时错误有明确异常。
 
@@ -92,14 +103,8 @@ def _run_ps(script: str) -> str:
     except OSError as exc:
         raise FirewallError(f"Failed to launch PowerShell: {exc}") from exc
 
-    def _dec(data: bytes) -> str:
-        # PS 控制台输出编码随系统 locale（中文系统为 GBK），UTF-8 优先、mbcs 兜底
-        try:
-            return data.decode("utf-8")
-        except UnicodeDecodeError:
-            return data.decode("mbcs", "replace")
-
-    stdout, stderr = _dec(proc.stdout or b""), _dec(proc.stderr or b"")
+    stdout = _decode_console(proc.stdout or b"")
+    stderr = _decode_console(proc.stderr or b"")
 
     if proc.returncode != 0:
         combined = f"{stderr}\n{stdout}".strip()
@@ -159,6 +164,87 @@ def _netsh_set_enabled(display_name: str, enabled: bool) -> bool:
     except (subprocess.TimeoutExpired, OSError):
         return False
     return proc.returncode == 0
+
+
+# ---------------------------------------------------------------- netsh 规则探测
+
+
+@dataclass(frozen=True)
+class NetshRuleInfo:
+    """netsh show rule 探测结果。remote_ips 已归一化（/32、/128 后缀剥除、
+    v6 压缩小写），可直接与 normalize_addr_set(config 侧) 比较。"""
+    exists: bool
+    enabled: bool
+    remote_ips: frozenset[str]
+
+
+def normalize_addr_set(values) -> frozenset[str]:
+    """把 CIDR/裸 IP 列表归一化为可比较的集合（ip_network.compressed）。
+    netsh 会把裸 IP 存成 /32（v4）/128（v6）后缀，两侧必须同口径比较。"""
+    return frozenset(
+        ipaddress.ip_network(str(v), strict=False).compressed for v in values
+    )
+
+
+def _parse_netsh_show(out: str) -> NetshRuleInfo | None:
+    """解析 netsh show rule verbose 输出（纯函数，可离线单测）。
+
+    只认中文/英文两种 label；关键行缺失或地址不可解析 → None
+    （调用方回退 PS 权威路径，宁可慢不可错判）。"""
+    enabled: bool | None = None
+    ips: set[str] = set()
+    saw_name = False
+    for line in out.splitlines():
+        key, sep, val = line.partition(":")
+        if not sep:
+            continue
+        key = key.strip().lower().replace(" ", "")
+        val = val.strip()
+        if key in ("规则名称", "rulename"):
+            saw_name = True
+        elif key in ("已启用", "enabled"):
+            if val in ("是", "Yes", "yes"):
+                enabled = True
+            elif val in ("否", "No", "no"):
+                enabled = False
+        elif key in ("远程ip", "remoteip"):
+            for tok in val.split(","):
+                tok = tok.strip()
+                if not tok or tok in ("任何", "Any", "*"):
+                    continue
+                try:
+                    ips.add(ipaddress.ip_network(tok, strict=False).compressed)
+                except ValueError:
+                    return None
+    if not saw_name or enabled is None:
+        return None
+    return NetshRuleInfo(exists=True, enabled=enabled, remote_ips=frozenset(ips))
+
+
+def probe_rule_netsh(display_name: str) -> NetshRuleInfo | None:
+    """netsh 快速探测单条规则（实测 ~0.11s，无 PS NetSecurity 加载税）。
+
+    返回 None = 进程失败/输出不可解析 → 调用方必须回退 PS 权威路径；
+    规则缺失返回 NetshRuleInfo(exists=False)（netsh rc=1 + "没有与指定
+    标准相匹配的规则"，中文 Win11 实测）。启动预热用它把"规则已就绪"
+    的常见路径从 ~3 个串行 PS（~9.6s）压到 ~0.3s。"""
+    cmd = ["netsh", "advfirewall", "firewall", "show", "rule",
+           f'name="{display_name}"', "verbose"]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=_NETSH_TIMEOUT,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    out = _decode_console(proc.stdout or b"")
+    if proc.returncode == 1:
+        return NetshRuleInfo(exists=False, enabled=False, remote_ips=frozenset())
+    if proc.returncode != 0:
+        return None
+    return _parse_netsh_show(out)
 
 
 # ---------------------------------------------------------------- CG-Global

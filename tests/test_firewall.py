@@ -539,3 +539,69 @@ class TestBlockAllPsScriptShape:
         fw.block_all(self._cfg(), None)
         assert ("if (Get-NetFirewallRule -DisplayName 'CG-FakeIP'"
                 in captured[0])
+
+
+class TestNormalizeAddrSet:
+    def test_strips_host_prefixes(self):
+        """netsh 把裸 IP 存成 /32（v4）//128（v6）后缀，归一化后两侧可比较。"""
+        assert fw.normalize_addr_set(["198.18.0.26", "2607:6bc0::1"]) == frozenset(
+            {"198.18.0.26/32", "2607:6bc0::1/128"})
+
+    def test_cidr_and_case_normalized(self):
+        a = fw.normalize_addr_set(["160.79.104.0/23"])
+        b = fw.normalize_addr_set(["160.79.104.0/23"])
+        assert a == b
+        assert fw.normalize_addr_set(["2607:6BC0::/48"]) == fw.normalize_addr_set(["2607:6bc0::/48"])
+
+
+class TestParseNetshShow:
+    """_parse_netsh_show 离线解析：样本来自中文 Win11 实机输出格式。"""
+
+    CN_GLOBAL_DISABLED = (
+        "\r\n规则名称:                             CG-Global\r\n"
+        "----------------------------------------------------------------------\r\n"
+        "已启用:                               否\r\n"
+        "方向:                                 出\r\n"
+        "本地 IP:                              任何\r\n"
+        "远程 IP:                              160.79.104.0/23\r\n"
+        "协议:                                 任何\r\n"
+        "操作:                                 阻止\r\n确定。\r\n"
+    )
+    CN_FAKEIP_ENABLED = (
+        "规则名称:                             CG-FakeIP\r\n"
+        "已启用:                               是\r\n"
+        "远程 IP:                              198.18.0.26/32,198.18.0.27/32,198.18.0.28/32,198.18.0.29/32\r\n"
+    )
+    EN_SAMPLE = (
+        "Rule Name:                            CG-V6\r\n"
+        "Enabled:                              Yes\r\n"
+        "RemoteIP:                             2607:6bc0::/48,2607:6bc0:11::/48\r\n"
+    )
+
+    def test_chinese_disabled_single_cidr(self):
+        info = fw._parse_netsh_show(self.CN_GLOBAL_DISABLED)
+        assert info is not None and info.exists
+        assert info.enabled is False
+        assert info.remote_ips == frozenset({"160.79.104.0/23"})
+
+    def test_chinese_enabled_strips_32_suffix(self):
+        info = fw._parse_netsh_show(self.CN_FAKEIP_ENABLED)
+        assert info is not None and info.enabled is True
+        assert info.remote_ips == frozenset(
+            {f"198.18.0.{n}/32" for n in (26, 27, 28, 29)})
+
+    def test_english_labels(self):
+        info = fw._parse_netsh_show(self.EN_SAMPLE)
+        assert info is not None and info.enabled is True
+        assert info.remote_ips == frozenset({"2607:6bc0::/48", "2607:6bc0:11::/48"})
+
+    def test_missing_enabled_line_is_ambiguous(self):
+        """关键行缺失 → None（调用方回退 PS，不得按某态猜）。"""
+        assert fw._parse_netsh_show("规则名称: CG-Global\r\n远程 IP: 1.2.3.0/24\r\n") is None
+
+    def test_unparseable_ip_is_ambiguous(self):
+        assert fw._parse_netsh_show(
+            "规则名称: CG-Global\r\n已启用: 是\r\n远程 IP: not-an-ip\r\n") is None
+
+    def test_garbage_output(self):
+        assert fw._parse_netsh_show("random noise") is None

@@ -74,7 +74,7 @@ main.py / scripts/run_guardian.py   打包入口 / 开发态入口（共用 main
 # 环境（已建）
 .venv/Scripts/python -m pip install -r requirements.txt   # 版本全部锁定
 
-# 测试（改任何代码后必跑；当前 327 passed）
+# 测试（改任何代码后必跑；当前 339 passed）
 .venv/Scripts/python -m pytest tests/ -q
 
 # 自检（只读，不碰防火墙；实机验证的第一手段）
@@ -124,7 +124,7 @@ main.py / scripts/run_guardian.py   打包入口 / 开发态入口（共用 main
 | 托盘 exe spawn PS 无标志 | PowerShell 黑窗闪屏 | CREATE_NO_WINDOW |
 | pystray run_detached + windowed exe | 点退出后进程挂活 | exited Event + os._exit(0) 兜底 |
 | `platform/` 包名 | 遮蔽 stdlib，frozen 打包命名冲突 | 已改名 winplat/ |
-| PS 单次调用 ~1.6s（冷启动 13s） | tick 内同步 PS 调用拖垮 B-7 时序 | 自愈独立线程 + _fw_lock 互斥 + 入口预热 |
+| PS 单次调用 ~1.6s（冷启动 13s） | tick 内同步 PS 调用拖垮 B-7 时序 | 自愈独立线程 + _fw_lock 互斥 + 入口预热（netsh show 探测 ~0.1s/条，就绪则跳过 PS：常见重启预热 9.6s→0.3s；地址集比较需 normalize_addr_set 剥 /32-/128） |
 | win11toast `toast()` await 用户交互 | 主循环阻塞 5-25s | notify 全部 daemon 线程异步 |
 | echo 探针域名与 Claude 不同分流组 | 测的是默认 Proxies 出口而非 Claude 出口（用户分流：Claude 走 ISP-SOCKS5）→ 换节点误拦/降级漏拦 | echo_endpoints 用同组域名（chatgpt.com/api.openai.com 的 /cdn-cgi/trace） |
 | netprobe 解析器按 TRACE_URL 精确比对分发 | 探针换非 cloudflare.com 域后被当纯文本 IP 解析恒 unparseable | 按 URL 路径后缀 `/cdn-cgi/trace` 分发 |

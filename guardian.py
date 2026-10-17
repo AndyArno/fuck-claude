@@ -607,31 +607,66 @@ class Guardian:
         return False
 
     def _preheat(self) -> None:
-        """启动预热：触发一次 PowerShell 冷启动，避免首轮检查超时误判。"""
+        """启动预热：netsh 快速探测三规则，已就绪则跳过 PS（常见重启路径
+        ~9.6s → ~0.5s）；缺失/状态不符/探测失败一律回退原 PS 路径
+        （fail-closed：不确定就走权威 PS，宁可慢不可错判）。"""
+        cfg = self.config
+        g = self.fw.probe_rule_netsh(cfg.rule_name_v4)
+        v6 = self.fw.probe_rule_netsh(cfg.rule_name_v6)
+        want_v4 = self.fw.normalize_addr_set(cfg.blocked_cidrs_v4)
+        want_v6 = self.fw.normalize_addr_set(cfg.blocked_cidrs_v6)
+        # CG-Global：启动初态恒阻断（P2-7：强杀残留 Disabled 不得留窗口）
         try:
             with self._fw_lock:
-                self.fw.ensure_exists(self.config)
-                # P2-7：ensure_exists 不改 Enabled 态——上次放行态强杀残留
-                # Disabled 时存在 ~5-13s 未阻断窗口。启动初态恒阻断，
-                # set_blocking(True)（netsh 快车道 ~0.4s）立即封死。
-                self.fw.set_blocking(self.config, True)
-            self.log.info("防火墙预热完成（CG-Global ensure_exists + 阻断态）")
+                if g is not None and g.exists and g.remote_ips == want_v4:
+                    if g.enabled:
+                        self.log.info("预热快进：CG-Global 已阻断且地址一致（跳过 PS）")
+                    else:
+                        # 残留放行态 → set_blocking(True) 内置 netsh 快车道 ~0.4s
+                        self.fw.set_blocking(cfg, True)
+                        self.log.info("预热：CG-Global 残留放行态，已快速封死（netsh）")
+                else:
+                    if g is not None and g.exists:
+                        # 地址集与配置不符（升级改了 CIDR）→ 覆盖重建
+                        # （ensure_exists 按名存在不动作，堵不住新段）
+                        self.log.warning("CG-Global 地址集与配置不符，重建")
+                        self.fw.create_rule(cfg)
+                    else:
+                        self.fw.ensure_exists(cfg)
+                    self.fw.set_blocking(cfg, True)
+            self.log.info("防火墙预热完成（CG-Global 阻断态确认）")
         except Exception as exc:
             self.log.error("防火墙预热失败（将继续，由自愈兜底）：%s", exc)
+        # CG-V6：存在 + Enabled + 地址一致 → 跳过；否则权威修复（含重建）
         try:
-            with self._fw_lock:
-                self.fw.ensure_enabled_v6(self.config)
+            if v6 is not None and v6.exists and v6.enabled \
+                    and v6.remote_ips == want_v6:
+                self.log.info("预热快进：CG-V6 已就绪（跳过 PS）")
+            else:
+                with self._fw_lock:
+                    if v6 is not None and v6.exists and v6.remote_ips != want_v6:
+                        self.log.warning("CG-V6 地址集与配置不符，重建")
+                        self.fw.create_rule_v6(cfg)
+                    else:
+                        self.fw.ensure_enabled_v6(cfg)
         except Exception as exc:
             self.log.error("CG-V6 预热失败：%s", exc)
-        # CG-FakeIP 预热：采集初始 fake-ip 集合并创建规则。失败不阻断启动
-        # （慢路径每轮重试；真实 IP 由 CG-Global 覆盖）。
+        # CG-FakeIP 预热：采集初始 fake-ip 集合；规则地址集已一致则跳过
+        # PS 重建。失败不阻断启动（慢路径每轮重试；真实 IP 由 CG-Global 覆盖）。
         try:
             ips = self._collect_fakeips()
             if ips:
-                with self._fw_lock:
-                    self.fw.create_rule_fakeip(self.config, list(ips))
-                self._fakeip_rule_ips = ips
-                self.log.info("CG-FakeIP 预热完成（%d 个 fake-ip）", len(ips))
+                f = self.fw.probe_rule_netsh(cfg.rule_name_fakeip)
+                if f is not None and f.exists \
+                        and f.remote_ips == self.fw.normalize_addr_set(ips):
+                    self._fakeip_rule_ips = ips
+                    self.log.info("预热快进：CG-FakeIP 地址集已一致（%d 个，跳过 PS）",
+                                  len(ips))
+                else:
+                    with self._fw_lock:
+                        self.fw.create_rule_fakeip(cfg, list(ips))
+                    self._fakeip_rule_ips = ips
+                    self.log.info("CG-FakeIP 预热完成（%d 个 fake-ip）", len(ips))
         except Exception as exc:
             self.log.error("CG-FakeIP 预热失败（将继续，由慢路径重试）：%s", exc)
 
