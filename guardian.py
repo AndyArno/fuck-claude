@@ -379,8 +379,16 @@ class Guardian:
         # 并发执行：wall time = max 而非 sum（坏网络实测串行 ~16s → ~8s）。
         # 两个 wrapper 内部已全吞异常返回结果对象，future.result() 不会再抛。
         ex = ThreadPoolExecutor(max_workers=2, thread_name_prefix="slow-probe")
-        fut_echo = ex.submit(self._probe_echo)
-        fut_dns = ex.submit(self._probe_dns_egress)
+
+        def _timed(fn, tag):
+            t = time.monotonic()
+            r = fn()
+            self.log.info("[耗时] 慢路径探针 %s %.0fms", tag,
+                          (time.monotonic() - t) * 1000)
+            return r
+
+        fut_echo = ex.submit(_timed, self._probe_echo, "echo")
+        fut_dns = ex.submit(_timed, self._probe_dns_egress, "dns")
         while not (fut_echo.done() and fut_dns.done()):
             if self._stop.is_set() or self._command_pending():
                 # 命令待处理（退出/暂停/临时放行）：中止本轮探测让主循环
