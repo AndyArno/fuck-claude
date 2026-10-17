@@ -18,9 +18,51 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 import requests
+import threading
+import time
 
 DOH_TIMEOUT_SEC = 15
 DOH_URL = "https://1.1.1.1/dns-query"
+GEO_TIMEOUT_SEC = 5
+GEO_URL = "https://api.country.is/"
+# /24 缓存（IPv4）：同段出口不重复查询（慢路径每 ~18s 一次，geo 服务
+# 无鉴权/配额，但没必要打）。TTL 1h 平衡节点换段后的时效性。
+_GEO_CACHE_TTL_SEC = 3600.0
+_geo_cache: dict[str, tuple[float, str | None]] = {}
+_geo_lock = threading.Lock()
+
+
+def lookup_country(ip: str) -> str | None:
+    """查询 IP 归属国（ISO 3166-1 alpha-2，如 'US'）。失败返回 None。
+
+    按 /24（IPv6 按 /64）缓存 1 小时。requests 异常/非 200/解析失败
+    一律 None——调用方按"无法确认"处理，绝不猜。
+    """
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    prefix = 24 if addr.version == 4 else 64
+    cache_key = str(
+        ipaddress.ip_network(f"{addr}/{prefix}", strict=False).network_address)
+    now = time.monotonic()
+    with _geo_lock:
+        hit = _geo_cache.get(cache_key)
+        if hit is not None and now - hit[0] < _GEO_CACHE_TTL_SEC:
+            return hit[1]
+    country: str | None = None
+    try:
+        resp = requests.get(GEO_URL + ip, timeout=GEO_TIMEOUT_SEC)
+        resp.raise_for_status()
+        data = resp.json()
+        code = data.get("country")
+        if isinstance(code, str) and len(code) == 2 and code.isalpha():
+            country = code.upper()
+    except Exception:
+        country = None
+    with _geo_lock:
+        _geo_cache[cache_key] = (now, country)
+    return country
 
 
 @dataclass(frozen=True)
@@ -222,7 +264,7 @@ def parse_egress_ip(records: Iterable[str]) -> str | None:
 def parse_ecs_cidr(records: Iterable[str]) -> str | None:
     """提取 ECS（EDNS Client Subnet）网段——威胁模型的核心证据字段。
 
-    akahelp whoami 的 ecs record 形如 ``198.51.100.0/24/24``（网段/前缀/作用域，
+    akahelp whoami 的 ecs record 形如 ``203.0.113.0/24/24``（网段/前缀/作用域，
     取第一段为 CIDR）。这是"权威 DNS 能看到的客户端网段"：真实链路下等于
     本地真实网段（泄漏），走代理时等于代理出口网段（干净）。纯函数可离线测试。
     """
@@ -296,18 +338,21 @@ def query_txt_windows(hostname: str) -> DnsEgressResult:
     return DnsEgressResult(ok=True, egress_ip=parse_egress_ip(records), records=records)
 
 
-def check_dns_egress(domain: str, whitelist: list[str]) -> tuple[str, DnsEgressResult]:
+def check_dns_egress(domain: str, whitelist: list[str],
+                     allowed_countries: list[str] | None = None,
+                     ) -> tuple[str, DnsEgressResult]:
     """DNS 出口探针（检查⑤）：whoami TXT → ECS/出口 → 三分类。
 
-    威胁模型（用户定义）：只关心 Anthropic 能否拿到真实网段，不在乎中间
-    递归商（Google/Cloudflare/运营商）看到什么。因此判定依据按优先级：
-    1. **ECS 网段**（权威 DNS 实际收到的客户端网段）∈ 白名单任一 IP 所在
-       网段（/24 对 /24）→ CLEAN——递归出口是谁不重要，Anthropic 只能看到
-       与你出口一致（或代理出口）的网段
-    2. ECS 网段 = 白名单精确配置的 CIDR → CLEAN（允许用户直接配网段）
-    3. 无 ECS 字段（Cloudflare 递归默认不带）→ 用递归出口 IP 判：∈ 白名单
-       网段 → CLEAN，否则 DIRTY（fail-closed：看不到证据 ≠ 干净）
-    返回 (verdict, probe)；UNREACHABLE = TXT 查询失败（第三方依赖不劫持门禁）。
+    判定链（按优先级）：
+    1. ECS/出口网段 ∈ whitelist 精确段 → CLEAN（逃生口：用户钉死特定
+       段，如 ISP 段；国家判定的补充而非替代）
+    2. ECS（无则递归出口 IP）归属国 ∈ allowed_countries → CLEAN。
+       核心：DNS 链路走代理 → 出口在代理落地国；真实家宽段（CN）
+       不在允许列表 → DIRTY。换同国节点免改配置。
+    3. geo 查询失败 → UNREACHABLE（"暂时无法确认"，不误拦不假放）
+    4. 无 ECS 且无出口 IP → DIRTY（fail-closed）
+    allowed_countries 为空/None 时跳过判定2（仅段白名单）。
+    返回 (verdict, probe)；UNREACHABLE = 探测失败，不劫持门禁。
     verdict 与 policy.CLEAN/DIRTY/UNREACHABLE 常量一致。
     """
     probe = query_txt_windows(domain)
@@ -319,40 +364,48 @@ def check_dns_egress(domain: str, whitelist: list[str]) -> tuple[str, DnsEgressR
             wl_nets.append(ipaddress.ip_network(entry, strict=False))
         except ValueError:
             continue
+
+    # 判定依据：ECS 网段优先（权威 DNS 实际收到的客户端网段），
+    # 无 ECS（Cloudflare 递归默认不带）回退递归出口 IP。
     ecs = parse_ecs_cidr(probe.records)
+    target_net = None
     if ecs is not None:
         try:
-            ecs_net = ipaddress.ip_network(ecs, strict=False)
+            target_net = ipaddress.ip_network(ecs, strict=False)
         except ValueError:
-            ecs_net = None
-        if ecs_net is not None:
-            # 判定1/2：ECS 网段与白名单网段的身份比对
+            target_net = None
+    if target_net is None and probe.egress_ip is None:
+        return "DIRTY", probe  # 无任何证据：fail-closed
+
+    # 判定1：精确段白名单（ECS 网段或回退出口 IP 直配）
+    if target_net is not None:
+        for net in wl_nets:
+            if target_net.version != net.version:
+                continue
+            if target_net == net or target_net.subnet_of(net):
+                return "CLEAN", probe
+    elif probe.egress_ip is not None:
+        try:
+            addr = ipaddress.ip_address(probe.egress_ip)
+        except ValueError:
+            addr = None
+        if addr is not None:
             for net in wl_nets:
-                if ecs_net == net:
+                if addr.version == net.version and addr in net:
                     return "CLEAN", probe
-                if ecs_net.version != net.version:
-                    continue
-                # /24 比对：同出口网段
-                if (ecs_net.supernet(new_prefix=min(24, ecs_net.prefixlen)) ==
-                        net.supernet(new_prefix=min(24, net.prefixlen))):
-                    return "CLEAN", probe
-                # /16 归属比对：出口 IP 与 ECS 同属一个 ISP 前缀（实测：
-                # 出口 203.0.113.x，ECS 报 198.51.100.0/24——同 Verizon 段
-                # 但 /24 不同）。同 /16 = Anthropic 看到的仍是代理提供商
-                # 网段而非本地运营商，无身份矛盾信号。
-                try:
-                    if (ecs_net.supernet(new_prefix=16) ==
-                            net.supernet(new_prefix=16)):
-                        return "CLEAN", probe
-                except ValueError:
-                    continue
-    # 无 ECS：回退到递归出口 IP 判定（fail-closed）
-    ip = probe.egress_ip
-    if ip is None:
-        return "DIRTY", probe
-    for net in wl_nets:
-        if ipaddress.ip_address(ip) in net:
+
+    # 判定2：归属国（geo_ip 取 ECS 网段首地址，或回退出口 IP）
+    if allowed_countries:
+        geo_ip = (str(target_net.network_address) if target_net is not None
+                  else probe.egress_ip)
+        country = lookup_country(geo_ip)
+        if country is None:
+            return "UNREACHABLE", probe  # geo 失败：无法确认
+        if country.upper() in {c.upper() for c in allowed_countries}:
             return "CLEAN", probe
+        return "DIRTY", probe
+
+    # 无国家配置且段白名单未命中：fail-closed
     return "DIRTY", probe
 
 

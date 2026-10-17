@@ -64,6 +64,8 @@ class Config:
     log_retention_days: int = 0
     dns_probe_domain: str = "whoami.ds.akahelp.net"
     dns_whitelist: list[str] = field(default_factory=list)
+    # 检查⑤出口归属国白名单（ISO 3166-1 alpha-2，如 "US"）；空=仅段判定
+    dns_egress_countries: list[str] = field(default_factory=list)
 
 
 def _require_str_nonempty(data: dict[str, Any], key: str, errors: list[str]) -> None:
@@ -140,6 +142,13 @@ def validate_config(data: Any) -> None:
                     ipaddress.ip_network(entry, strict=False)
                 except ValueError:
                     errors.append(f"字段 'dns_whitelist' 含非法 IP/CIDR: {entry!r}")
+    # 可选 dns_egress_countries：ISO 3166-1 alpha-2 国家码列表（如 ["US"]）
+    dec = data.get("dns_egress_countries")
+    if dec is not None:
+        if (not isinstance(dec, list)
+                or not all(isinstance(x, str) and len(x) == 2 and x.isalpha()
+                           for x in dec)):
+            errors.append(f"字段 'dns_egress_countries' 必须是两位国家码列表（当前值: {dec!r}）")
     # 可选 rule_name_fakeip：给了就必须是非空字符串，缺省 "CG-FakeIP"
     rnf = data.get("rule_name_fakeip")
     if rnf is not None and (not isinstance(rnf, str) or not rnf.strip()):
@@ -187,4 +196,6 @@ def load(path: str | Path) -> Config:
                        data.get("dns_probe_domain", "whoami.ds.akahelp.net"))
     object.__setattr__(cfg, "dns_whitelist",
                        list(data.get("dns_whitelist") or data.get("whitelist") or []))
+    object.__setattr__(cfg, "dns_egress_countries",
+                       [c.upper() for c in (data.get("dns_egress_countries") or [])])
     return cfg

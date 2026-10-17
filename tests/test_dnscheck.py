@@ -118,7 +118,7 @@ class TestGuardianDnsEgress:
             ok=ok, egress_ip=egress_ip if ok else None,
             records=("ns",) if ok else (),
             error=None if ok else "timeout")
-        d.check_dns_egress = lambda domain, wl: (
+        d.check_dns_egress = lambda domain, wl, countries=None: (
             (policy.CLEAN if (ok and egress_ip and egress_ip in wl)
              else (policy.UNREACHABLE if not ok else policy.DIRTY)),
             d.egress)
@@ -209,13 +209,91 @@ class TestGuardianDnsEgress:
         """探针抛异常不杀主循环，按 UNREACHABLE 处理。"""
         import tests.test_guardian as guardian_tests
         d = guardian_tests.FakeDns()
-        def boom(domain, wl):
+        def boom(domain, wl, countries=None):
             raise RuntimeError("boom")
         d.check_dns_egress = boom
         g, *_ , _ = guardian_tests.make_guardian(tmp_path, dns=d)
         verdict, probe = g._probe_dns_egress()
         assert verdict == policy.UNREACHABLE
         assert probe.ok is False
+
+
+class TestCountryVerdict:
+    """⑤归属国判定：段白名单优先 → 国家 → geo 失败三态。"""
+
+    def _probe(self, records):
+        return dnscheck.DnsEgressResult(ok=True, egress_ip=None, records=records)
+
+    def test_country_in_allowed_is_clean(self, monkeypatch):
+        # ECS=美国段（RFC 5737 文档段仅作假 IP，国家由桩决定）
+        monkeypatch.setattr(dnscheck, "query_txt_windows",
+                            lambda host: self._probe(
+                                ("ns", "198.51.100.1", "ecs", "203.0.113.0/24/24")))
+        monkeypatch.setattr(dnscheck, "lookup_country", lambda ip: "US")
+        verdict, _ = dnscheck.check_dns_egress(
+            "whoami.ds.akahelp.net", [], allowed_countries=["US"])
+        assert verdict == policy.CLEAN
+
+    def test_country_not_allowed_is_dirty(self, monkeypatch):
+        monkeypatch.setattr(dnscheck, "query_txt_windows",
+                            lambda host: self._probe(
+                                ("ns", "198.51.100.1", "ecs", "203.0.113.0/24/24")))
+        # 真实家宽段场景：出口在中国 → 不在允许列表
+        monkeypatch.setattr(dnscheck, "lookup_country", lambda ip: "CN")
+        verdict, _ = dnscheck.check_dns_egress(
+            "whoami.ds.akahelp.net", [], allowed_countries=["US"])
+        assert verdict == policy.DIRTY
+
+    def test_geo_failure_is_unreachable(self, monkeypatch):
+        monkeypatch.setattr(dnscheck, "query_txt_windows",
+                            lambda host: self._probe(
+                                ("ns", "198.51.100.1", "ecs", "203.0.113.0/24/24")))
+        monkeypatch.setattr(dnscheck, "lookup_country", lambda ip: None)
+        verdict, _ = dnscheck.check_dns_egress(
+            "whoami.ds.akahelp.net", [], allowed_countries=["US"])
+        assert verdict == policy.UNREACHABLE
+
+    def test_cidr_whitelist_beats_country(self, monkeypatch):
+        """段白名单命中时 CLEAN，即使国家不在允许列表（段=更强证据）。"""
+        monkeypatch.setattr(dnscheck, "query_txt_windows",
+                            lambda host: self._probe(
+                                ("ns", "198.51.100.1", "ecs", "203.0.113.0/24/24")))
+        monkeypatch.setattr(dnscheck, "lookup_country", lambda ip: "CN")
+        verdict, _ = dnscheck.check_dns_egress(
+            "whoami.ds.akahelp.net", ["203.0.113.0/24"],
+            allowed_countries=["US"])
+        assert verdict == policy.CLEAN
+
+    def test_no_countries_falls_back_to_cidr_only(self, monkeypatch):
+        """allowed_countries 为空：跳过国家判定，仅段白名单。"""
+        monkeypatch.setattr(dnscheck, "query_txt_windows",
+                            lambda host: self._probe(
+                                ("ns", "198.51.100.1", "ecs", "203.0.113.0/24/24")))
+        calls = []
+        monkeypatch.setattr(dnscheck, "lookup_country",
+                            lambda ip: calls.append(ip) or "US")
+        verdict, _ = dnscheck.check_dns_egress(
+            "whoami.ds.akahelp.net", ["203.0.113.0/24"])
+        assert verdict == policy.CLEAN
+        assert calls == []  # 未配置国家 → 不查 geo
+
+    def test_lookup_country_caches_by_prefix(self, monkeypatch):
+        """/24 缓存：同段两次查询只打一次外部服务。"""
+        calls = []
+        def fake_get(url, timeout=None):
+            calls.append(url)
+
+            class R:
+                def raise_for_status(self): pass
+                def json(self): return {"country": "US"}
+            return R()
+        monkeypatch.setattr(dnscheck.requests, "get", fake_get)
+        dnscheck._geo_cache.clear()
+        assert dnscheck.lookup_country("203.0.113.5") == "US"
+        assert dnscheck.lookup_country("203.0.113.99") == "US"  # 同 /24
+        assert len(calls) == 1
+        assert dnscheck.lookup_country("198.51.100.7") == "US"  # 异段
+        assert len(calls) == 2
 
 
 def messages_reason(s):

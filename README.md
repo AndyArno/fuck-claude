@@ -13,12 +13,17 @@ Windows 门禁工具：mihomo（Clash Verge）未在正确代理链路时自动�
   1. mihomo 进程存活；
   2. TUN 网卡存在；
   3. fake-ip 生效（claude.ai 解析落在 198.18.0.0/15）；
-  4. echo 出口 IP 三分法：命中白名单 → 放行；落在封禁段 → 立即阻断；不可达 → 按阈值升级；
+  4. echo 出口 IP 三分法：命中白名单 → 放行；落在封禁段 → 立即阻断；不可达 → 按阈值升级。
+     探针端点（`echo_endpoints`）应选用**与 Claude 同一分流组**的域名
+     （如 chatgpt.com / api.openai.com 的 `/cdn-cgi/trace`），测得的就是
+     Claude 实际连接出口；
   5. DNS 出口干净（检查⑤）：向 `dns_probe_domain`（默认 `whoami.ds.akahelp.net`）发
-     TXT 查询（走系统 resolver，TUN 模式下经 mihomo 路由），从回答中提取实际递归
-     出口 IP。不在白名单（`dns_whitelist`，缺省复用 `whitelist`）→ 立即阻断
-     （DNS 泄漏 = 出口脏，Anthropic 可借此看到真实运营商 DNS 出口）；
-     探针不可达 → 计入不可达阈值，不单点要挟门禁。
+     TXT 查询（走系统 resolver，TUN 模式下经 mihomo 路由），从回答中提取 ECS
+     网段（无 ECS 回退递归出口 IP）。判定链：命中 `dns_whitelist` 精确段 →
+     干净；否则查归属国（`dns_egress_countries`，如 `["US"]`）→ 在允许国
+     = 干净（DNS 走代理、出口在代理落地国），否则 → 立即阻断（DNS 泄漏：
+     解析从真实运营商网段裸奔，Anthropic 可借此看到真实网段）；
+     探针或归属国查询不可达 → 计入不可达阈值，不单点要挟门禁。
 - **漂移监控**：定期经 DoH 解析 Claude 域名、查 RIPE 上 ASN 宣告段，
   发现 IP 段漂移时托盘黄色告警（只提醒，不动规则）。
 - **配置热生效**：托盘"编辑白名单"打开 `config.json`，保存后无需重启，
@@ -112,8 +117,10 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 | `blocked_cidrs_v4` | 封禁的 Claude IPv4 段（CG-Global 封这些段） |
 | `blocked_cidrs_v6` | 封禁的 IPv6 段（CG-V6 全封，门禁无权放行） |
 | `rule_name_v4` / `rule_name_v6` | 防火墙规则名（默认 CG-Global / CG-V6，改名前先卸载旧规则） |
-| `whitelist` | 白名单出口 IP/CIDR：echo 出口命中即放行。**编辑保存即热生效，无需重启** |
-| `echo_endpoints` | 探测出口 IP 的 HTTP 端点（返回出口 IP 的 URL） |
+| `whitelist` | ④连接出口白名单 IP/CIDR：echo 出口命中即放行。**编辑保存即热生效，无需重启** |
+| `echo_endpoints` | 探测出口 IP 的 HTTP 端点。**必须与 Claude 同分流组**（否则测错路径）；`/cdn-cgi/trace` 结尾自动用 trace 解析 |
+| `dns_whitelist` | ⑤解析出口精确段白名单（缺省复用 `whitelist`）。段命中直接判干净，优先于国家 |
+| `dns_egress_countries` | ⑤解析出口归属国白名单（ISO 3166-1 两位码，如 `["US"]`）：ECS/出口落地国在列表内=干净。换同国节点免改配置；配空则仅用段判定 |
 | `fakeip_range` | fake-ip 网段，用于确认 DNS 走了 TUN（默认 198.18.0.0/15） |
 | `mihomo_process` | mihomo 进程名（如 verge-mihomo.exe） |
 | `tun_adapter_keywords` | TUN 网卡名关键字（任一命中即认定存在） |

@@ -101,7 +101,10 @@ def probe_echo_endpoints(endpoints: list[str], timeout: float = ECHO_TIMEOUT_SEC
             last_error = f"{url}: {exc}"
             continue
 
-        if url == TRACE_URL:
+        # 按路径特征分发：任何 /cdn-cgi/trace 端点（cloudflare.com、
+        # chatgpt.com、api.openai.com 等 CF 代理域）都用 trace 解析。
+        # 曾按 TRACE_URL 精确比对，探针换域后被当纯文本 IP 解析恒失败。
+        if url.rstrip("/").endswith("/cdn-cgi/trace"):
             ip = parse_trace_ip(resp.text)
             parser_name = "trace"
         else:

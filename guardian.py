@@ -425,7 +425,8 @@ class Guardian:
         """检查⑤：whoami TXT 探针，返回 (verdict, DnsEgressResult)。"""
         try:
             return self.dns.check_dns_egress(
-                self.config.dns_probe_domain, self.dns_whitelist)
+                self.config.dns_probe_domain, self.dns_whitelist,
+                self.config.dns_egress_countries)
         except Exception as exc:
             self.log.warning("DNS 出口探针异常：%s", exc)
             return policy.UNREACHABLE, dnscheck.DnsEgressResult(
@@ -789,15 +790,13 @@ class Guardian:
             return False
         elif cmd == "exit":
             # 需求 T-6：恢复 Enabled（阻断）后退出。
-            # 先 ensure_exists 再 enable：规则若已被第三方删除，仅 enable 会
-            # 3 次重试全抛错后裸退（复审 H4 边缘缺口）——必须重建再启用。
+            # 单 PS 进程完成"缺失重建+启用+复查"两条规则（block_all）：
+            # 原 4 次串行 PS 实测 ~15.6s（[耗时] 日志），现 ~3-4s。
+            # 重建语义保留复审 H4 修复：规则被删时仅 enable 会假成功。
             self.log.info("收到 EXIT 命令：恢复阻断后退出")
-            self._fw_tolerant("ensure_exists")
-            self._fw_tolerant("enable")
-            if self._fakeip_rule_ips:
-                self._fw_tolerant("ensure_exists_fakeip",
-                                  list(self._fakeip_rule_ips))
-            self._fw_tolerant("enable_fakeip")
+            self._fw_tolerant(
+                "block_all",
+                list(self._fakeip_rule_ips) if self._fakeip_rule_ips else None)
             self._stop.set()
             return False
         else:

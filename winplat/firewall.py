@@ -209,6 +209,57 @@ def set_blocking(config: Config, blocking: bool) -> None:
                 f"set_blocking({blocking}) verification failed: {states!r}"
             )
 
+def block_all(config: Config, fakeip_ips: list[str] | None = None) -> None:
+    """退出路径专用：一个 PS 进程确保 CG-Global + CG-FakeIP 都 Enabled。
+
+    原退出路径 4 次串行 PS 调用（ensure_exists→enable→ensure_exists_fakeip
+    →enable_fakeip）实测 ~15.6s（每次进程付 ~2.5s NetSecurity 加载税，
+    [耗时] 日志证据）。本函数单进程完成"缺失重建 + 启用 + 数组复查"。
+    CG-V6 不在本函数职责内：它由 heal 线程 ensure_enabled_v6 常驻保障
+    （永久阻断，退出语义不改变它）。
+    fakeip_ips=None/空 → CG-FakeIP 不存在则跳过（无 fake-ip 集合时
+    重建无意义，与原路径 if self._fakeip_rule_ips 一致）。
+    """
+    n1 = _ps_quote(config.rule_name_v4)
+    n2 = _ps_quote(config.rule_name_fakeip)
+    remote1 = _ps_array(list(config.blocked_cidrs_v4))
+    fakeip_part = ""
+    if fakeip_ips:
+        remote2 = _ps_array(list(fakeip_ips))
+        fakeip_part = (
+            f"$r2 = Get-NetFirewallRule -DisplayName {n2} -ErrorAction SilentlyContinue; "
+            f"if (-not $r2) {{ Remove-NetFirewallRule -DisplayName {n2} "
+            "-ErrorAction SilentlyContinue; "
+            "New-NetFirewallRule -DisplayName " + n2
+            + " -Direction Outbound -Action Block -Enabled True"
+            + " -RemoteAddress " + remote2 + " | Out-Null; }; "
+            f"Enable-NetFirewallRule -DisplayName {n2} -ErrorAction Stop; "
+        )
+    script = (
+        "Import-Module NetSecurity; "
+        f"$r1 = Get-NetFirewallRule -DisplayName {n1} -ErrorAction SilentlyContinue; "
+        f"if (-not $r1) {{ Remove-NetFirewallRule -DisplayName {n1} "
+        "-ErrorAction SilentlyContinue; "
+        "New-NetFirewallRule -DisplayName " + n1
+        + " -Direction Outbound -Action Block -Enabled True"
+        + " -RemoteAddress " + remote1 + " | Out-Null; }; "
+        f"Enable-NetFirewallRule -DisplayName {n1} -ErrorAction Stop; "
+        + fakeip_part
+        + f"(Get-NetFirewallRule -DisplayName @({n1},{n2})"
+        " -ErrorAction SilentlyContinue)"
+        " | ForEach-Object { Write-Output ([string]$_.Enabled) }"
+    )
+    out = _run_ps(script)
+    states = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+    # 复查：查到的规则必须全部 Enabled 且至少 1 条（CG-Global）。
+    # fakeip_ips 为空时 CG-FakeIP 可能不存在（输出 1 行）——但若它
+    # 恰好存在（守护期间创建过）也不能算失败：Enable 阶段已带
+    # -ErrorAction Stop，存在即已被强制启用，2 行 True 同样合法。
+    # （首版按 expected 严格行数比对，CG-FakeIP 存在时恒误判失败。）
+    if not states or any(s != "True" for s in states):
+        raise FirewallError(
+            f"block_all verification failed: {states!r} out={out!r}")
+
 
 def _build_get_status_script(name: str) -> str:
     """构造查询规则状态的 PS 脚本（纯函数，可离线单测）。name 需先经 _ps_quote。"""

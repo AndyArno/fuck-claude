@@ -93,7 +93,7 @@ main.py / scripts/run_guardian.py   打包入口 / 开发态入口（共用 main
 - **git 提交信息一律中文**，格式 `<类型>(<范围>)?: <描述>——<关键实测证据>`
   （例：`fix: PS 子进程加 CREATE_NO_WINDOW——托盘切换不再闪黑窗`）。
 - **【安全红线】禁止向 git 提交任何用户敏感信息**：真实出口 IP、**其所在网段前缀**
-  （/24 及更宽——`203.0.113.0/24` 与精确 IP 同等敏感，曾因此二次重写历史）、
+  （/24 及更宽——网段前缀与精确 IP 同等敏感，曾因此二次重写历史）、
   DNS 递归出口、本地网段（ECS）、节点/机场信息。此仓库曾两次全历史重写（59a0232/1b4c1b0）。
   - `config.json` 已被 gitignore 排除（真实白名单在内），**永远不要 `git add -f config.json`**；
     需要改配置 schema 时改 `config.example.json`（模板，IP 用 RFC 5737 保留地址
@@ -126,6 +126,12 @@ main.py / scripts/run_guardian.py   打包入口 / 开发态入口（共用 main
 | `platform/` 包名 | 遮蔽 stdlib，frozen 打包命名冲突 | 已改名 winplat/ |
 | PS 单次调用 ~1.6s（冷启动 13s） | tick 内同步 PS 调用拖垮 B-7 时序 | 自愈独立线程 + _fw_lock 互斥 + 入口预热 |
 | win11toast `toast()` await 用户交互 | 主循环阻塞 5-25s | notify 全部 daemon 线程异步 |
+| echo 探针域名与 Claude 不同分流组 | 测的是默认 Proxies 出口而非 Claude 出口（用户分流：Claude 走 ISP-SOCKS5）→ 换节点误拦/降级漏拦 | echo_endpoints 用同组域名（chatgpt.com/api.openai.com 的 /cdn-cgi/trace） |
+| netprobe 解析器按 TRACE_URL 精确比对分发 | 探针换非 cloudflare.com 域后被当纯文本 IP 解析恒 unparseable | 按 URL 路径后缀 `/cdn-cgi/trace` 分发 |
+| exe 读 dist/config.json 而非仓库根 config.json | 只改源码目录配置，exe 行为不变，误判"修复无效" | 改完同步 cp config.json dist/（或直接改 dist 侧） |
+| ⑤段白名单与④共用 | Proxies 组换段（机场节点段漂移）后⑤恒 DIRTY 永久阻断 | ⑤改归属国判定（dns_egress_countries=["US"]，geo /24 缓存 1h），段白名单仅作精确逃生口 |
+| PS 复查按"期望行数"严格比对 | 规则存在性与 ips 参数不对齐时恒误判失败（block_all 首版：CG-FakeIP 存在→2 行 vs 期望 1 行→重试 3 次白拖 8s） | 复查语义=查到的必须全 Enabled 且≥1 条，Enable 带 -ErrorAction Stop |
+| 退出命令 4 次串行 PS 调用 | 托盘退出 15.6s（每次 ~2.5s NetSecurity 加载税） | firewall.block_all() 单进程"重建+启用+复查"，实测 3.6s |
 
 ## 文档地图
 

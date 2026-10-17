@@ -62,6 +62,16 @@ class FakeFirewall:
             self.disable(config)
             self.disable_fakeip(config)
 
+    def block_all(self, config, fakeip_ips=None) -> None:
+        """退出路径批量恢复阻断（单 PS 优化路径）：等价 ensure+enable
+        两规则；fakeip_ips 为空时不碰 FakeIP 规则。"""
+        self.calls.append("block_all")
+        self.ensure_exists(config)
+        self.enable(config)
+        if fakeip_ips:
+            self.ensure_exists_fakeip(config, fakeip_ips)
+            self.enable_fakeip(config)
+
     def get_status(self, config):
         self.calls.append("get_status")
         if self.missing:
@@ -150,7 +160,7 @@ class FakeDns:
     def doh_resolve(self, hostname, **kw):
         return guardian.dnscheck.DohResult(ok=True, addresses=("160.79.104.10",))
 
-    def check_dns_egress(self, domain, whitelist):
+    def check_dns_egress(self, domain, whitelist, allowed_countries=None):
         """检查⑤默认桩：出口 203.0.113.10 ∈ 默认白名单 → CLEAN。"""
         return policy.CLEAN, guardian.dnscheck.DnsEgressResult(
             ok=True, egress_ip="203.0.113.10", records=("ns", "203.0.113.10"))
