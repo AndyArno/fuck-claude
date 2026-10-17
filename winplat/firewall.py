@@ -220,14 +220,21 @@ def set_blocking(config: Config, blocking: bool) -> None:
     非终止错误升级为脚本失败，`_run_ps` 抛 FirewallError，disable 的
     "规则不存在=已放行"幂等分支被前置短路永不可达。
 
-    复查按方向收紧：
-    - blocking=True：CG-Global 必须存在且 Enabled（states 首位，Enable
-      按数组顺序操作）；CG-FakeIP 缺失可接受（无 fake-ip 集合时本就
-      不存在，heal 线程 ensure_exists 重建兜底）。
+    复查按方向收紧（逐名标记，不依赖返回顺序）：
+    - blocking=True：CG-Global 必须存在且 Enabled（按名字判定）；CG-FakeIP
+      缺失可接受（无 fake-ip 集合时本就不存在，heal 线程 ensure_exists
+      重建兜底）。
     - blocking=False：所有实际存在的规则均 False 即成功；states 为空
       （两条都不存在）= 幂等成功。
     动词对不存在规则 exit 0 假成功——不能只看 _run_ps 不抛，必须逐值
     比对 states（AGENTS.md 已录坑）。
+
+    顺序坑（P1-3 复审实测证伪）：Get-NetFirewallRule 数组参数的返回顺序
+    与输入顺序无关（本机正/逆序各 3 轮输出全同，CIM 按内部存储序），
+    且重复 DisplayName 会展开多行。按行序对应规则名会在"CG-Global 缺失
+    而 CG-FakeIP 存在"时把 FakeIP 的 True 误当 CG-Global 已启用——
+    fail-closed 破口。故复查脚本逐名查询并输出"名字=Enabled"标记，
+    Python 侧按名字索引。
     """
     # ---- netsh 快车道（实测 ~235ms/次，两条 ~0.5s vs PS 单进程 2.7-3.8s）。
     # CG-Global 成功即证明权限与工具链正常；此时 CG-FakeIP rc=1 只可能是
@@ -245,27 +252,34 @@ def set_blocking(config: Config, blocking: bool) -> None:
     script = (
         "Import-Module NetSecurity;"
         f"{verb}-NetFirewallRule -DisplayName @({n1},{n2});"
-        f"(Get-NetFirewallRule -DisplayName @({n1},{n2})"
-        " -ErrorAction SilentlyContinue)"
-        " | ForEach-Object { Write-Output ([string]$_.Enabled) }"
+        # 逐名复查输出"名字=Enabled"标记（顺序不可依赖，见 docstring）；
+        # @($r)[0] 折叠同名重复规则（历史残留/第三方重建）。
+        f"foreach ($n in @({n1},{n2})) {{"
+        " $r = Get-NetFirewallRule -DisplayName $n -ErrorAction SilentlyContinue;"
+        " if ($r) { Write-Output ($n + '=' + [string](@($r)[0].Enabled)) } }"
     )
     out = _run_ps(script)
-    states = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+    states: dict[str, str] = {}
+    for ln in (out or "").splitlines():
+        if "=" in ln:
+            k, _, v = ln.rpartition("=")
+            states[k.strip()] = v.strip()
     if not blocking:
         # disable：所有实际存在的规则都已 False 即成功；
         # states 为空 = 两条都不存在 = 幂等成功。
-        for s in states:
+        for name, s in states.items():
             if s != want:
                 raise FirewallError(
                     f"set_blocking(False) verification failed: {states!r}"
                 )
         return
-    # enable：CG-Global（首位）必须存在且 Enabled；CG-FakeIP 缺失可接受。
-    if not states or states[0] != want:
+    # enable：CG-Global 必须存在且 Enabled（按名字，非行序）；CG-FakeIP
+    # 缺失可接受，存在则必须 Enabled。
+    if states.get(config.rule_name_v4) != want:
         raise FirewallError(
             f"set_blocking(True) CG-Global not enabled: states={states!r}"
         )
-    for s in states[1:]:
+    for name, s in states.items():
         if s != want:
             raise FirewallError(
                 f"set_blocking(True) verification failed: {states!r}"

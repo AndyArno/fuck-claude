@@ -188,7 +188,9 @@ class TestSetBlockingOffline:
     """P1-3：set_blocking 离线断言（喂 PS 输出文本，不发真 PS）。
 
     动词去掉 -ErrorAction Stop 后，CG-FakeIP 缺失场景必须由复查层
-    正确判读——这组用例锁住按方向收紧的复查语义。"""
+    正确判读——这组用例锁住按方向收紧的复查语义。
+    复查输出为逐名"名字=Enabled"标记（P1-3 复审：数组 Get 顺序不可
+    依赖，按行序对应规则名是 fail-closed 破口）。"""
 
     def _cfg(self):
         return type("C", (), {
@@ -206,8 +208,9 @@ class TestSetBlockingOffline:
         return captured
 
     def test_script_shape(self, monkeypatch):
-        """动词不带 -ErrorAction Stop（P1-3 核心）；数组字面量；无 -Protocol。"""
-        captured = self._run(monkeypatch, "True\nTrue\n")
+        """动词不带 -ErrorAction Stop（P1-3 核心）；数组字面量；无 -Protocol；
+        复查逐名标记（不依赖返回顺序）。"""
+        captured = self._run(monkeypatch, "CG-Global=True\nCG-FakeIP=True\n")
         fw.set_blocking(self._cfg(), True)
         s = captured[0]
         verb_part = [ln for ln in s.split(";") if "NetFirewallRule" in ln
@@ -215,10 +218,11 @@ class TestSetBlockingOffline:
         assert "-ErrorAction Stop" not in verb_part
         assert "@('CG-Global','CG-FakeIP')" in s
         assert "-Protocol" not in s
+        assert "foreach ($n in" in s  # 逐名复查，非数组 Get 按序对应
 
     def test_disable_fakeip_missing_idempotent(self, monkeypatch):
-        """CG-FakeIP 不存在（单行 False）→ 幂等放行，不抛。"""
-        self._run(monkeypatch, "False\n")
+        """CG-FakeIP 不存在（仅 CG-Global=False）→ 幂等放行，不抛。"""
+        self._run(monkeypatch, "CG-Global=False\n")
         fw.set_blocking(self._cfg(), False)  # 不得抛
 
     def test_disable_both_missing_idempotent(self, monkeypatch):
@@ -227,8 +231,8 @@ class TestSetBlockingOffline:
         fw.set_blocking(self._cfg(), False)  # 不得抛
 
     def test_enable_fakeip_missing_ok(self, monkeypatch):
-        """enable 后仅 CG-Global 在（单行 True）→ 达标不抛。"""
-        self._run(monkeypatch, "True\n")
+        """enable 后仅 CG-Global 在（CG-Global=True）→ 达标不抛。"""
+        self._run(monkeypatch, "CG-Global=True\n")
         fw.set_blocking(self._cfg(), True)  # 不得抛
 
     def test_enable_global_missing_raises(self, monkeypatch):
@@ -241,12 +245,21 @@ class TestSetBlockingOffline:
         else:
             raise AssertionError("enable with no rules must raise")
 
-    def test_enable_partial_failure_raises(self, monkeypatch):
-        """enable 后 CG-FakeIP 仍 Disabled（False,True）→ 抛错。
+    def test_enable_only_fakeip_present_raises(self, monkeypatch):
+        """fail-closed 回归（P1-3 复审）：CG-Global 缺失而 CG-FakeIP 存在
+        且 Enabled 时，不得把 FakeIP 的 True 误认作 CG-Global 已启用。"""
+        self._run(monkeypatch, "CG-FakeIP=True\n")
+        try:
+            fw.set_blocking(self._cfg(), True)
+        except fw.FirewallError:
+            pass
+        else:
+            raise AssertionError(
+                "CG-FakeIP-only must not satisfy CG-Global check")
 
-        注：Get 数组按 DisplayName 顺序返回，CG-Global 在前——
-        states=['False','True'] 即 CG-Global Disabled，必须抛。"""
-        self._run(monkeypatch, "False\nTrue\n")
+    def test_enable_partial_failure_raises(self, monkeypatch):
+        """enable 后 CG-Global 仍 Disabled（CG-Global=False）→ 必抛。"""
+        self._run(monkeypatch, "CG-Global=False\nCG-FakeIP=True\n")
         try:
             fw.set_blocking(self._cfg(), True)
         except fw.FirewallError:
@@ -254,14 +267,9 @@ class TestSetBlockingOffline:
         else:
             raise AssertionError("partial enable must raise")
 
-    def test_enable_global_true_fakeip_missing_ok(self, monkeypatch):
-        """states=['True']：CG-Global Enabled、CG-FakeIP 缺失 → 不抛。"""
-        self._run(monkeypatch, "True\n")
-        fw.set_blocking(self._cfg(), True)
-
     def test_disable_partial_failure_raises(self, monkeypatch):
-        """disable 后仍有 Enabled（True,False）→ 抛错（复查强度不变）。"""
-        self._run(monkeypatch, "True\nFalse\n")
+        """disable 后仍有 Enabled（CG-Global=True）→ 抛错（复查强度不变）。"""
+        self._run(monkeypatch, "CG-Global=True\nCG-FakeIP=False\n")
         try:
             fw.set_blocking(self._cfg(), False)
         except fw.FirewallError:
@@ -326,8 +334,9 @@ class TestNetshFastLane:
         """CG-Global netsh 失败（缺失/权限）→ 回退 PS 全量路径。"""
         self._netsh(monkeypatch, {"CG-Global": False})
         captured = []
-        monkeypatch.setattr(fw, "_run_ps",
-                            lambda s: captured.append(s) or "True\nTrue\n")
+        monkeypatch.setattr(
+            fw, "_run_ps",
+            lambda s: captured.append(s) or "CG-Global=True\nCG-FakeIP=True\n")
         fw.set_blocking(self._cfg(), True)
         assert captured and "Enable-NetFirewallRule" in captured[0]
 

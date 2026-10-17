@@ -211,7 +211,7 @@ class Tray:
             try:
                 self._icon.update_menu()
             except Exception:
-                pass  # 菜单更新失败不影响守护
+                log.exception("托盘菜单重建失败（下轮状态事件自愈）")
         # 详情窗开着期间实时刷新（状态变化/新检查结果立即反映）
         with self._detail_lock:
             if self._detail_box is not None and not self._detail_box.closed:
