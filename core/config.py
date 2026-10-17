@@ -194,8 +194,11 @@ def load(path: str | Path) -> Config:
                        data.get("rule_name_fakeip", "CG-FakeIP"))
     object.__setattr__(cfg, "dns_probe_domain",
                        data.get("dns_probe_domain", "whoami.ds.akahelp.net"))
+    # 语义约定（与消费方 drift 一致）：dns_whitelist 键存在（含显式 []）→ 用之；
+    # 键缺失 → 回退 whitelist。None 不是合法值，显式 null 会被校验拒绝。
     object.__setattr__(cfg, "dns_whitelist",
-                       list(data.get("dns_whitelist") or data.get("whitelist") or []))
+                       list(data["dns_whitelist"]) if "dns_whitelist" in data
+                       else list(data.get("whitelist", [])))
     object.__setattr__(cfg, "dns_egress_countries",
                        [c.upper() for c in (data.get("dns_egress_countries") or [])])
     return cfg

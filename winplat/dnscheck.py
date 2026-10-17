@@ -28,6 +28,9 @@ GEO_URL = "https://api.country.is/"
 # /24 缓存（IPv4）：同段出口不重复查询（慢路径每 ~18s 一次，geo 服务
 # 无鉴权/配额，但没必要打）。TTL 1h 平衡节点换段后的时效性。
 _GEO_CACHE_TTL_SEC = 3600.0
+# 失败负缓存（country=None）用短 TTL：瞬时故障不该被放大为最长 1h 的
+# UNREACHABLE→确认窗升级阻断（P2-2）。
+_GEO_FAIL_TTL_SEC = 60.0
 _geo_cache: dict[str, tuple[float, str | None]] = {}
 _geo_lock = threading.Lock()
 
@@ -48,8 +51,10 @@ def lookup_country(ip: str) -> str | None:
     now = time.monotonic()
     with _geo_lock:
         hit = _geo_cache.get(cache_key)
-        if hit is not None and now - hit[0] < _GEO_CACHE_TTL_SEC:
-            return hit[1]
+        if hit is not None:
+            ttl = _GEO_CACHE_TTL_SEC if hit[1] is not None else _GEO_FAIL_TTL_SEC
+            if now - hit[0] < ttl:
+                return hit[1]
     country: str | None = None
     try:
         resp = requests.get(GEO_URL + ip, timeout=GEO_TIMEOUT_SEC)
@@ -61,6 +66,12 @@ def lookup_country(ip: str) -> str | None:
     except Exception:
         country = None
     with _geo_lock:
+        # 写入时顺带清理过期项（成功项 1h、失败项 60s 各自按 TTL 判定），
+        # 避免 _geo_cache 只增不减。
+        for key, (ts, val) in list(_geo_cache.items()):
+            ttl = _GEO_CACHE_TTL_SEC if val is not None else _GEO_FAIL_TTL_SEC
+            if now - ts >= ttl:
+                del _geo_cache[key]
         _geo_cache[cache_key] = (now, country)
     return country
 

@@ -2,6 +2,8 @@
 
 from winplat import firewall as fw
 
+import pytest
+
 
 class TestBuildGetStatusScript:
     def test_script_uses_direct_property_access(self):
@@ -427,3 +429,107 @@ class TestEnsureEnabledV6Offline:
         fw.ensure_enabled_v6(self._cfg())
         assert "create_rule_v6" not in calls
         assert not any("Enable-NetFirewallRule" in s for s in calls)
+
+
+class TestRunPsErrorClassification:
+    """P2-14（B 侧）：_run_ps rc≠0 分类与 _dec UTF-8→mbcs 回退。
+    全部 monkeypatch subprocess.run，零真实子进程。"""
+
+    def _cfg_module_run(self, monkeypatch, returncode, stdout=b"", stderr=b""):
+        import types
+
+        def fake_run(cmd, capture_output, timeout, creationflags):
+            return types.SimpleNamespace(
+                returncode=returncode, stdout=stdout, stderr=stderr)
+
+        captured = {}
+        real_run = fw.subprocess.run
+
+        def spy(cmd, **kw):
+            captured["cmd"] = cmd
+            captured["kw"] = kw
+            return fake_run(cmd, **kw)
+
+        monkeypatch.setattr(fw.subprocess, "run", spy)
+        return captured
+
+    def test_access_denied_chinese_raises_permission(self, monkeypatch):
+        self._cfg_module_run(monkeypatch, 1, stderr="拒绝访问。".encode("gbk"))
+        with pytest.raises(fw.FirewallPermissionError):
+            fw._run_ps("Get-NetFirewallRule")
+
+    def test_access_denied_english_raises_permission(self, monkeypatch):
+        self._cfg_module_run(monkeypatch, 1,
+                             stderr=b"Access is denied.")
+        with pytest.raises(fw.FirewallPermissionError):
+            fw._run_ps("Get-NetFirewallRule")
+
+    def test_access_denied_permissiondenied_marker(self, monkeypatch):
+        self._cfg_module_run(monkeypatch, 1,
+                             stderr=b"PermissionDenied: cmdlet")
+        with pytest.raises(fw.FirewallPermissionError):
+            fw._run_ps("Get-NetFirewallRule")
+
+    def test_generic_error_raises_firewall_error(self, monkeypatch):
+        self._cfg_module_run(monkeypatch, 1, stderr=b"some random failure")
+        with pytest.raises(fw.FirewallError) as ei:
+            fw._run_ps("Get-NetFirewallRule")
+        assert not isinstance(ei.value, fw.FirewallPermissionError)
+        assert "some random failure" in str(ei.value)
+
+    def test_ps_flags_no_profile_noninteractive_no_window(self, monkeypatch):
+        captured = self._cfg_module_run(monkeypatch, 0, stdout=b"ok\n")
+        assert fw._run_ps("Write-Output ok") == "ok"
+        cmd, kw = captured["cmd"], captured["kw"]
+        assert "-NoProfile" in cmd and "-NonInteractive" in cmd
+        assert kw.get("creationflags") == fw.subprocess.CREATE_NO_WINDOW
+
+    def test_dec_utf8_then_mbcs_fallback(self, monkeypatch):
+        """UTF-8 可解码原样输出；非法 UTF-8 回退 mbcs（GBK）。"""
+        self._cfg_module_run(monkeypatch, 0, stdout=b"ok\n")
+        assert fw._run_ps("'ok'") == "ok"
+        # GBK 编码的中文（非法 UTF-8 序列）→ mbcs 兜底正确还原
+        self._cfg_module_run(
+            monkeypatch, 0, stdout="拒绝访问".encode("gbk"))
+        assert "拒绝访问" in fw._run_ps("'拒绝访问'")
+
+
+class TestBlockAllPsScriptShape:
+    """P2-9：PS 回退路径——CG-FakeIP 存在即无条件 Enable（n2 Enable 段
+    恒在），缺失且 fakeip_ips 非空才含 New-NetFirewallRule 重建段。"""
+
+    def _cfg(self):
+        return type("C", (), {
+            "rule_name_v4": "CG-Global",
+            "rule_name_fakeip": "CG-FakeIP",
+            "blocked_cidrs_v4": ["160.79.104.0/23"],
+        })()
+
+    def test_empty_fakeips_still_enables_n2(self, monkeypatch):
+        captured = []
+        monkeypatch.setattr(fw, "_netsh_set_enabled", lambda n, e: False)
+        monkeypatch.setattr(fw, "_run_ps",
+                            lambda s: captured.append(s) or "True\n")
+        fw.block_all(self._cfg(), None)
+        assert "Enable-NetFirewallRule -DisplayName 'CG-FakeIP'" in captured[0]
+        # 无重建段
+        assert "New-NetFirewallRule -DisplayName 'CG-FakeIP'" not in captured[0]
+
+    def test_nonempty_fakeips_contains_rebuild_segment(self, monkeypatch):
+        captured = []
+        monkeypatch.setattr(fw, "_netsh_set_enabled", lambda n, e: False)
+        monkeypatch.setattr(fw, "_run_ps",
+                            lambda s: captured.append(s) or "True\nTrue\n")
+        fw.block_all(self._cfg(), ["198.18.0.1", "198.18.0.2"])
+        script = captured[0]
+        assert "New-NetFirewallRule -DisplayName 'CG-FakeIP'" in script
+        assert "Enable-NetFirewallRule -DisplayName 'CG-FakeIP'" in script
+        assert "@('198.18.0.1','198.18.0.2')" in script
+
+    def test_script_never_writes_protocol(self, monkeypatch):
+        captured = []
+        monkeypatch.setattr(fw, "_netsh_set_enabled", lambda n, e: False)
+        monkeypatch.setattr(fw, "_run_ps",
+                            lambda s: captured.append(s) or "True\nTrue\n")
+        fw.block_all(self._cfg(), ["198.18.0.1"])
+        assert "-Protocol" not in captured[0]

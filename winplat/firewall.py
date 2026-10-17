@@ -307,7 +307,12 @@ def block_all(config: Config, fakeip_ips: list[str] | None = None) -> None:
     n1 = _ps_quote(config.rule_name_v4)
     n2 = _ps_quote(config.rule_name_fakeip)
     remote1 = _ps_array(list(config.blocked_cidrs_v4))
-    fakeip_part = ""
+    # P2-9（PS 回退路径）：CG-FakeIP 存在即无条件 Enable（fail-closed，
+    # 不依赖 fakeip_ips 是否已知）；缺失且 fakeip_ips 非空才重建。
+    # fakeip_ips 为空时仍对已存在的 CG-FakeIP 执行 Enable（n2 Enable 段
+    # 恒在），只是没有 New-NetFirewallRule 重建段。
+    enable2 = f"Enable-NetFirewallRule -DisplayName {n2} -ErrorAction Stop; "
+    fakeip_part = enable2
     if fakeip_ips:
         remote2 = _ps_array(list(fakeip_ips))
         fakeip_part = (
@@ -317,7 +322,7 @@ def block_all(config: Config, fakeip_ips: list[str] | None = None) -> None:
             "New-NetFirewallRule -DisplayName " + n2
             + " -Direction Outbound -Action Block -Enabled True"
             + " -RemoteAddress " + remote2 + " | Out-Null; }; "
-            f"Enable-NetFirewallRule -DisplayName {n2} -ErrorAction Stop; "
+            + enable2
         )
     script = (
         "Import-Module NetSecurity; "

@@ -295,6 +295,173 @@ class TestCountryVerdict:
         assert dnscheck.lookup_country("198.51.100.7") == "US"  # 异段
         assert len(calls) == 2
 
+    def test_geo_failure_short_ttl_then_retry(self, monkeypatch):
+        """P2-2：失败负缓存 60s——失败后 60s 内重查会真正再发请求。"""
+        calls = []
+        state = {"fail": True}
+
+        def fake_get(url, timeout=None):
+            calls.append(url)
+
+            class R:
+                def raise_for_status(self):
+                    if state["fail"]:
+                        raise RuntimeError("boom")
+
+                def json(self):
+                    return {"country": "US"}
+            return R()
+        monkeypatch.setattr(dnscheck.requests, "get", fake_get)
+        dnscheck._geo_cache.clear()
+        assert dnscheck.lookup_country("203.0.113.5") is None
+        # 仍在短 TTL 内：缓存命中（不再发请求），但返回 None
+        assert dnscheck.lookup_country("203.0.113.5") is None
+        assert len(calls) == 1
+        # 越过 60s TTL：缓存过期 → 真正重查，服务恢复 → 成功按 1h 缓存
+        key = next(iter(dnscheck._geo_cache))
+        ts, val = dnscheck._geo_cache[key]
+        dnscheck._geo_cache[key] = (ts - 61.0, val)
+        state["fail"] = False
+        assert dnscheck.lookup_country("203.0.113.5") == "US"
+        assert len(calls) == 2
+        # 成功后再次查询走 1h 缓存
+        assert dnscheck.lookup_country("203.0.113.5") == "US"
+        assert len(calls) == 2
+
+    def test_geo_cache_sweeps_expired_entries(self, monkeypatch):
+        """P2-2 顺手清理：写入时剔除过期项，缓存不无限增长。"""
+        monkeypatch.setattr(dnscheck.requests, "get",
+                            lambda url, timeout=None: (_ for _ in ()).throw(
+                                RuntimeError("net down")))
+        dnscheck._geo_cache.clear()
+        assert dnscheck.lookup_country("203.0.113.5") is None
+        assert dnscheck.lookup_country("198.51.100.5") is None
+        assert len(dnscheck._geo_cache) == 2
+        # 把其中一项时间戳回拨到过期线之外
+        key = "203.0.113.0"
+        assert key in dnscheck._geo_cache
+        ts, val = dnscheck._geo_cache[key]
+        dnscheck._geo_cache[key] = (ts - 61.0, val)
+        assert dnscheck.lookup_country("203.0.113.6") is None
+        # 过期项被清理后随本次失败重写，时间戳刷新
+        assert dnscheck._geo_cache[key][0] > ts
+        assert len(dnscheck._geo_cache) == 2
+
+
+# ------------------------------------------------------- parse_ecs_cidr
+
+class TestParseEcsCidr:
+    def test_triple_form(self):
+        assert dnscheck.parse_ecs_cidr(
+            ("ns", "203.0.113.0/24/24")) == "203.0.113.0/24"
+
+    def test_plain_cidr(self):
+        assert dnscheck.parse_ecs_cidr(("203.0.113.0/24",)) == "203.0.113.0/24"
+
+    def test_comma_separated_tokens(self):
+        assert dnscheck.parse_ecs_cidr(
+            ("ns,203.0.113.0/24/24",)) == "203.0.113.0/24"
+
+    def test_no_ecs(self):
+        assert dnscheck.parse_ecs_cidr(("ns", "198.51.100.20")) is None
+
+    def test_empty(self):
+        assert dnscheck.parse_ecs_cidr(()) is None
+
+    def test_invalid_cidr_skipped(self):
+        assert dnscheck.parse_ecs_cidr(("999.0.113.0/24",)) is None
+
+
+# ---------------------------------------------- check⑤ ECS 三判定（离线）
+
+def _probe(records, egress_ip=None):
+    return dnscheck.DnsEgressResult(ok=True, egress_ip=egress_ip,
+                                    records=records)
+
+
+class TestCheckDnsEgressEcs:
+    def test_ecs_in_whitelist_clean(self, monkeypatch):
+        """判定1：ECS 网段精确命中段白名单 → CLEAN。"""
+        _patch_query(monkeypatch, _probe(("ns", "203.0.113.0/24/24")))
+        verdict, _ = dnscheck.check_dns_egress(
+            "whoami.ds.akahelp.net", ["203.0.113.0/24"])
+        assert verdict == policy.CLEAN
+
+    def test_ecs_supernet_of_whitelist_entry_clean(self, monkeypatch):
+        """判定1：ECS /24 是白名单 /16 的子网 → subnet_of 命中 → CLEAN。"""
+        _patch_query(monkeypatch, _probe(("ecs", "203.0.113.0/24/24")))
+        verdict, _ = dnscheck.check_dns_egress(
+            "whoami.ds.akahelp.net", ["203.0.113.0/16"])
+        assert verdict == policy.CLEAN
+
+    def test_ecs_country_attribution_uses_geo(self, monkeypatch):
+        """判定2：ECS /16 不在段白名单 → 归属国判定走 geo（取网段首地址）。"""
+        _patch_query(monkeypatch, _probe(("ecs", "198.51.100.0/16/16")))
+        monkeypatch.setattr(dnscheck, "lookup_country",
+                            lambda ip: "US")
+        verdict, _ = dnscheck.check_dns_egress(
+            "whoami.ds.akahelp.net", ["203.0.113.0/24"],
+            allowed_countries=["US"])
+        assert verdict == policy.CLEAN
+
+    def test_ecs_country_not_allowed_dirty(self, monkeypatch):
+        _patch_query(monkeypatch, _probe(("ecs", "198.51.100.0/16/16")))
+        monkeypatch.setattr(dnscheck, "lookup_country", lambda ip: "CN")
+        verdict, _ = dnscheck.check_dns_egress(
+            "whoami.ds.akahelp.net", ["203.0.113.0/24"],
+            allowed_countries=["US"])
+        assert verdict == policy.DIRTY
+
+
+# ----------------------------------------------------- check_fakeip 边界
+
+class TestCheckFakeipEdges:
+    def test_bad_range_value_error(self):
+        r = dnscheck.check_fakeip("claude.example", fakeip_range="not-a-cidr")
+        assert r.ok is False and r.error is not None
+        assert "bad fakeip_range" in r.error
+
+    def test_resolver_oserror(self):
+        def boom(host):
+            raise OSError("net down")
+        r = dnscheck.check_fakeip("claude.example", resolver=boom)
+        assert r.ok is False and r.error is not None
+        assert "resolve failed" in r.error
+
+    def test_empty_resolution(self):
+        r = dnscheck.check_fakeip("claude.example", resolver=lambda h: ())
+        assert r.ok is False and r.error == "no addresses resolved"
+
+    def test_first_address_in_range(self):
+        r = dnscheck.check_fakeip(
+            "claude.example",
+            fakeip_range="198.18.0.0/15",
+            resolver=lambda h: ("198.18.0.1",))
+        assert r.ok is True and r.in_fakeip_range is True
+
+    def test_last_address_in_range(self):
+        # /15 198.18.0.0/15 的末地址是 198.19.255.255
+        r = dnscheck.check_fakeip(
+            "claude.example",
+            fakeip_range="198.18.0.0/15",
+            resolver=lambda h: ("198.19.255.255",))
+        assert r.ok is True and r.in_fakeip_range is True
+
+    def test_adjacent_prefix_not_in_range(self):
+        # 198.18.0.0/15 只覆盖 198.18.x–198.19.x；198.20.0.1 是相邻段
+        r = dnscheck.check_fakeip(
+            "claude.example",
+            fakeip_range="198.18.0.0/15",
+            resolver=lambda h: ("198.20.0.1",))
+        assert r.ok is True and r.in_fakeip_range is False
+
+    def test_unparseable_ip_ignored(self):
+        r = dnscheck.check_fakeip(
+            "claude.example",
+            fakeip_range="198.18.0.0/15",
+            resolver=lambda h: ("not-an-ip",))
+        assert r.ok is True and r.in_fakeip_range is False
+
 
 def messages_reason(s):
     from core import messages

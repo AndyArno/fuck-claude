@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from core.messages import Status, tooltip
+from core.messages import Status, reason_text, toast_block, tooltip
 
 
 def _status(**kw) -> Status:
@@ -65,3 +65,20 @@ class TestTooltip:
         lines = text.split("\n")
         assert len(lines) == 3
         assert "代理✓" in lines[2] and "DNS✓" in lines[2]
+
+
+class TestReasonDnsEgressFalse:
+    """P2-4：dns_egress_ok=False 且 dns_leak_ip=None（akahelp 有应答
+    无可解析 IP）不得落兜底"环境正常"。"""
+
+    def test_reason_no_normal_environment(self):
+        s = _status(dns_egress_ok=False, dns_leak_ip=None)
+        text = reason_text(s)
+        assert "环境正常" not in text
+        assert "DNS" in text
+
+    def test_toast_block_no_normal_environment(self):
+        s = _status(dns_egress_ok=False, dns_leak_ip=None)
+        title, body = toast_block(s)
+        assert "环境正常" not in body
+        assert "DNS" in body

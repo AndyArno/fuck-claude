@@ -16,7 +16,9 @@ PS_TIMEOUT = 10
 
 def ps(script: str) -> str:
     cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", script]
-    proc = subprocess.run(cmd, capture_output=True, timeout=PS_TIMEOUT)
+    proc = subprocess.run(
+        cmd, capture_output=True, timeout=PS_TIMEOUT,
+        creationflags=subprocess.CREATE_NO_WINDOW)
 
     def _dec(data: bytes) -> str:
         try:
@@ -68,13 +70,13 @@ def main() -> int:
             "$n=" + _q(v4) + ";"
             "if (Get-NetFirewallRule -DisplayName $n -EA SilentlyContinue){Remove-NetFirewallRule -DisplayName $n};"
             "New-NetFirewallRule -DisplayName $n -Direction Outbound -Action Block -Enabled True"
-            " -Protocol TCP -RemoteAddress " + _ps_array(cfg["blocked_cidrs_v4"]) + "|Out-Null"
+            " -RemoteAddress " + _ps_array(cfg["blocked_cidrs_v4"]) + "|Out-Null"
         )
         ps(
             "$n=" + _q(v6) + ";"
             "if (Get-NetFirewallRule -DisplayName $n -EA SilentlyContinue){Remove-NetFirewallRule -DisplayName $n};"
             "New-NetFirewallRule -DisplayName $n -Direction Outbound -Action Block -Enabled True"
-            " -Protocol TCP -RemoteAddress " + _ps_array(cfg["blocked_cidrs_v6"]) + "|Out-Null"
+            " -RemoteAddress " + _ps_array(cfg["blocked_cidrs_v6"]) + "|Out-Null"
         )
     except subprocess.TimeoutExpired:
         if not admin:

@@ -74,8 +74,23 @@ if ($choice -eq "1") {
 }
 
 # ④ 应用到全部规则 + 逐条复查（Enable/Disable 的 -PassThru 返回切换前快照，不可信）
+# P2-10：CG-V6 是 IPv6 侧永久防线，停用即失去 IPv6 防护——放在显式二次
+# 确认分支里，用户明确同意才随批量停用；拒绝时保留 CG-V6 Enabled。
+$targets = $existing
+if (-not $desired) {
+    if ($existing -contains "CG-V6") {
+        Write-Host ""
+        Write-Host "⚠ 即将停用 CG-V6：守护的 IPv6 防线将失去保护"
+        Write-Host "  （停用期间 IPv6 出口不再被拦截）。"
+        $yn = Read-Host "确认停用 CG-V6？输入 Y 继续，其他输入保留 CG-V6 拦截"
+        if ($yn -ne "Y" -and $yn -ne "y") {
+            $targets = @($existing | Where-Object { $_ -ne "CG-V6" })
+            Write-Host "已保留 CG-V6 拦截，仅停用其他规则。"
+        }
+    }
+}
 $failed = @()
-foreach ($r in $existing) {
+foreach ($r in $targets) {
     if ($desired) {
         Enable-NetFirewallRule -DisplayName $r -ErrorAction SilentlyContinue
     } else {
@@ -95,8 +110,11 @@ if ($failed.Count -gt 0) {
 }
 
 if ($desired) {
-    Write-Host "√ 已开启拦截（$($existing -join ' / ') 全部启用）"
+    Write-Host "√ 已开启拦截（$($targets -join ' / ') 全部启用）"
 } else {
-    Write-Host "√ 已关闭拦截（$($existing -join ' / ') 全部停用）"
+    Write-Host "√ 已关闭拦截（$($targets -join ' / ') 全部停用）"
+    if ($existing -contains "CG-V6" -and $targets -notcontains "CG-V6") {
+        Write-Host "  CG-V6 保持启用（未确认停用），IPv6 侧防线仍在。"
+    }
     Write-Host "  注意：此时 Claude 流量不再受 Claude Guard 保护。"
 }

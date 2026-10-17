@@ -90,6 +90,10 @@ def reason_text(s: Status) -> str:
         return "暂时无法确认出口 IP（探测失败，稍后重试）"
     if s.in_whitelist is False:
         return f"出口 IP 不干净（当前出口 {s.exit_ip or '未知'}，不在你的白名单里）"
+    if s.dns_egress_ok is False:
+        # 有应答但拿不到可解析出口 IP（各更强的失败分支都未命中）：
+        # 按"无法确认"处理，绝不落兜底"环境正常"（P2-4，fail-closed）。
+        return "DNS 解析出口异常（探针应答无法确认出口，已按泄漏处理）"
     if s.confirming:
         return "检查已通过，正在确认环境稳定（稍后自动放行）"
     return "代理环境正常，出口 IP 在白名单内"

@@ -164,6 +164,26 @@ def test_dns_whitelist_wrong_type(tmp_path):
         cfg.load(write_cfg(tmp_path, data))
 
 
+def test_dns_whitelist_explicit_empty_list_no_fallback(tmp_path):
+    """P2-3：显式 [] 不被 or 链吞掉——不回退 whitelist，保持空。"""
+    data = dict(VALID, dns_whitelist=[])
+    c = cfg.load(write_cfg(tmp_path, data))
+    assert c.dns_whitelist == []
+
+
+def test_dns_whitelist_missing_falls_back_to_whitelist(tmp_path):
+    """P2-3：键缺失 → 回退 whitelist。"""
+    c = cfg.load(write_cfg(tmp_path, dict(VALID)))
+    assert c.dns_whitelist == VALID["whitelist"]
+
+
+def test_dns_whitelist_explicit_value_used(tmp_path):
+    """P2-3：显式值直接用之（回归覆盖）。"""
+    data = dict(VALID, dns_whitelist=["198.51.100.0/24"])
+    c = cfg.load(write_cfg(tmp_path, data))
+    assert c.dns_whitelist == ["198.51.100.0/24"]
+
+
 def test_rule_name_fakeip_default(tmp_path):
     c = cfg.load(write_cfg(tmp_path, VALID))
     assert c.rule_name_fakeip == "CG-FakeIP"
