@@ -142,4 +142,4 @@ main.py / scripts/run_guardian.py   打包入口 / 开发态入口（共用 main
 - `docs/03-dev-plan.md` — 里程碑与测试矩阵（12 条状态机用例与 tests/test_statemachine.py 一一对应）。
 - `docs/04-audit-2026-10.md` — 2026-10 全盘审查报告（bug/性能/文档失真清单 + 修复优先级）。
 - `docs/05-fix-plan-p1.md` — P1 级问题修复方案（根因/决策/代码改动/测试/验证，按 P1-1→3→2→4 顺序实施）。
-- `README.md` — 用户手册（安装/卸载/三步排查/升级说明——升级需手动删旧规则重建）。
+- `README.md` — 用户手册（安装/卸载/三步排查/升级说明——）。
