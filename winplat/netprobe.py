@@ -7,14 +7,16 @@
 from __future__ import annotations
 
 import ipaddress
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import psutil
 import requests
 
-# B-7：慢路径 echo 探测运行在 tick 内（串行），端点不可达时超时直接决定
-# 慢轮耗时上限（2 端点 × timeout）。5s×2 曾把慢轮拖到 ~10s；3s×2=6s 上限
-# 同时保证正常端点（<1s）不受影响。DIRTY 判定仍基于本轮最新探测结果。
+# B-7：慢路径 echo 探测运行在 tick 内，端点不可达时超时直接决定慢轮
+# 耗时上限。双端点并发（probe_echo_endpoints 线程池）后 wall time ≈
+# 单个 timeout 而非 2×（坏网络实测 ~6s → ~3s）。DIRTY 判定仍基于本轮
+# 最新探测结果。
 ECHO_TIMEOUT_SEC = 3
 
 # 备端点：纯文本 IP
@@ -83,41 +85,53 @@ def _looks_like_ip(text: str | None) -> bool:
         return False
 
 
+def _probe_one(url: str, timeout: float) -> EchoResult:
+    """探测单个 echo 端点（任何异常都吞进 EchoResult，供线程池安全使用）。
+
+    按路径特征分发：任何 /cdn-cgi/trace 端点（cloudflare.com、
+    chatgpt.com、api.openai.com 等 CF 代理域）都用 trace 解析。
+    分发前剥 query/fragment 并 lower（P3-4）。"""
+    try:
+        resp = requests.get(url, timeout=timeout, headers={"User-Agent": _ECHO_USER_AGENT})
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        return EchoResult(ok=False, ip=None, endpoint=None, error=f"{url}: {exc}")
+    except Exception as exc:  # 防御：解析期异常不炸线程池
+        return EchoResult(ok=False, ip=None, endpoint=None, error=f"{url}: {exc}")
+
+    path = url.split("://", 1)[-1].split("?", 1)[0].split("#", 1)[0].rstrip("/").lower()
+    if path.endswith("/cdn-cgi/trace"):
+        ip = parse_trace_ip(resp.text)
+        parser_name = "trace"
+    else:
+        ip = parse_ip_sb(resp.text)
+        parser_name = "text"
+
+    if not _looks_like_ip(ip):
+        return EchoResult(ok=False, ip=None, endpoint=None,
+                          error=f"{url}: unparseable response ({parser_name})")
+    return EchoResult(ok=True, ip=ip, endpoint=url)
+
+
 def probe_echo_endpoints(endpoints: list[str], timeout: float = ECHO_TIMEOUT_SEC) -> EchoResult:
-    """依次探测 echo 端点，主端点失败自动切备。
+    """并发探测 echo 端点，按列表顺序取第一个可用结果。
 
-    - /cdn-cgi/trace 结尾端点：解析 trace 文本的 ip= 行
-    - 其他端点（如 api.ip.sb/ip）：按纯文本 IP 处理
-    返回第一个成功端点的结构化结果；全部失败返回 ok=False。
-
-    分发前剥 query/fragment 并 lower：`.../cdn-cgi/trace?x=1` 或
-    大小写变体同样走 trace 解析（P3-4）。
-    """
-    last_error = "no endpoints configured"
-    for url in endpoints:
-        try:
-            resp = requests.get(url, timeout=timeout, headers={"User-Agent": _ECHO_USER_AGENT})
-            resp.raise_for_status()
-        except requests.RequestException as exc:
-            last_error = f"{url}: {exc}"
-            continue
-
-        # 按路径特征分发：任何 /cdn-cgi/trace 端点（cloudflare.com、
-        # chatgpt.com、api.openai.com 等 CF 代理域）都用 trace 解析。
-        path = url.split("://", 1)[-1].split("?", 1)[0].split("#", 1)[0].rstrip("/").lower()
-        if path.endswith("/cdn-cgi/trace"):
-            ip = parse_trace_ip(resp.text)
-            parser_name = "trace"
-        else:
-            ip = parse_ip_sb(resp.text)
-            parser_name = "text"
-
-        if not _looks_like_ip(ip):
-            last_error = f"{url}: unparseable response ({parser_name})"
-            continue
-        return EchoResult(ok=True, ip=ip, endpoint=url)
-
-    return EchoResult(ok=False, ip=None, endpoint=None, error=last_error)
+    主备语义保持（列表顺序优先），但不再串行等待：主端点超时期间备端点
+    同时在跑，wall time = 最慢端点而非总和（双端点各 3s 超时场景
+    ~6s → ~3s）。全部失败时 error 汇总各端点原因。"""
+    if not endpoints:
+        return EchoResult(ok=False, ip=None, endpoint=None,
+                          error="no endpoints configured")
+    if len(endpoints) == 1:
+        return _probe_one(endpoints[0], timeout)
+    with ThreadPoolExecutor(max_workers=len(endpoints),
+                            thread_name_prefix="echo-probe") as ex:
+        results = list(ex.map(lambda u: _probe_one(u, timeout), endpoints))
+    for res in results:  # ex.map 保序 → 列表顺序优先
+        if res.ok:
+            return res
+    return EchoResult(ok=False, ip=None, endpoint=None,
+                      error="; ".join(r.error or "?" for r in results))
 
 
 def check_mihomo_process(process_name: str) -> bool:

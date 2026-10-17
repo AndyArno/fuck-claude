@@ -176,3 +176,74 @@ def test_trace_url_constant_removed():
     """P3-4：TRACE_URL 死常量已删。"""
     import winplat.netprobe as np
     assert not hasattr(np, "TRACE_URL")
+
+
+# ---- 并发探测（probe_echo_endpoints 线程池化） ----------------------------
+
+class TestProbeEchoParallel:
+    """双端点并发：顺序优先语义不变，wall time 不再相加。"""
+
+    @staticmethod
+    def _resp(text):
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+        FakeResp.text = text
+        return FakeResp()
+
+    def test_order_preference_both_ok(self, monkeypatch):
+        """两个都通 → 返回列表第一个端点的结果（主备语义保持）。"""
+        import winplat.netprobe as np
+        mapping = {
+            "https://a.test/cdn-cgi/trace": self._resp("ip=203.0.113.1\n"),
+            "https://b.test/ip": self._resp("203.0.113.2\n"),
+        }
+        monkeypatch.setattr(np.requests, "get", lambda url, **k: mapping[url])
+        r = np.probe_echo_endpoints(list(mapping))
+        assert r.ok and r.ip == "203.0.113.1" and r.endpoint == "https://a.test/cdn-cgi/trace"
+
+    def test_primary_fails_backup_wins(self, monkeypatch):
+        import winplat.netprobe as np
+        import requests as rq
+
+        def fake_get(url, **k):
+            if "a.test" in url:
+                raise rq.RequestException("boom")
+            return self._resp("203.0.113.9\n")
+
+        monkeypatch.setattr(np.requests, "get", fake_get)
+        r = np.probe_echo_endpoints(["https://a.test/cdn-cgi/trace", "https://b.test/ip"])
+        assert r.ok and r.ip == "203.0.113.9"
+
+    def test_all_fail_error_aggregates(self, monkeypatch):
+        import winplat.netprobe as np
+        import requests as rq
+
+        def fake_get(url, **k):
+            raise rq.RequestException(f"down-{url}")
+
+        monkeypatch.setattr(np.requests, "get", fake_get)
+        eps = ["https://a.test/cdn-cgi/trace", "https://b.test/ip"]
+        r = np.probe_echo_endpoints(eps)
+        assert not r.ok
+        assert all(u in r.error for u in eps)  # 两个端点原因都在，可排障
+
+    def test_endpoints_run_concurrently(self, monkeypatch):
+        """并发证明：两端点共享 Barrier(2)；串行执行必 broken。"""
+        import threading
+        import winplat.netprobe as np
+
+        barrier = threading.Barrier(2)
+        serial = []
+
+        def fake_get(url, **k):
+            try:
+                barrier.wait(timeout=2)  # 串行时第一个等待者超时 → BrokenBarrierError
+            except threading.BrokenBarrierError:
+                serial.append(url)
+            return self._resp("203.0.113.3\n")
+
+        monkeypatch.setattr(np.requests, "get", fake_get)
+        r = np.probe_echo_endpoints(["https://a.test/ip", "https://b.test/ip"])
+        assert r.ok and r.ip == "203.0.113.3"
+        assert serial == []

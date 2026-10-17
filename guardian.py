@@ -28,6 +28,7 @@ import queue
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from core import checks as core_checks
@@ -374,13 +375,20 @@ class Guardian:
         except Exception as exc:
             self.log.warning("CG-FakeIP 刷新失败（保持现状）：%s", exc)
         fakeip_ok = self._check_fakeip()
-        echo = self._probe_echo()
+        # echo 与 DNS 探针互相独立（前者量出口 IP、后者量递归出口），
+        # 并发执行：wall time = max 而非 sum（坏网络实测串行 ~16s → ~8s）。
+        # 两个 wrapper 内部已全吞异常返回结果对象，future.result() 不会再抛。
+        with ThreadPoolExecutor(max_workers=2,
+                                thread_name_prefix="slow-probe") as ex:
+            fut_echo = ex.submit(self._probe_echo)
+            fut_dns = ex.submit(self._probe_dns_egress)
+            echo = fut_echo.result()
+            dns_verdict, dns_probe = fut_dns.result()
         verdict_before = policy.classify(echo.ip if echo.ok else None,
                                          list(self.config.whitelist))
         self._last_echo_ip = echo.ip if echo.ok else self._last_echo_ip
         # ⑤ DNS 出口探针：递归出口 IP 不在白名单与出口脏同权（立即阻断）；
         # akahelp 不可达则 UNREACHABLE，计入现有不可达计数。
-        dns_verdict, dns_probe = self._probe_dns_egress()
         # 综合：任一 DIRTY 即 DIRTY（立即阻断）；两者都 CLEAN 才算 CLEAN；
         # 否则（echo 或 DNS 不可达）走 UNREACHABLE 计数语义。
         if policy.DIRTY in (verdict_before, dns_verdict):
@@ -1187,8 +1195,28 @@ def selfcheck(config: Config, logger: logging.Logger | None = None) -> int:
     fk_ok = bool(fk.ok and fk.in_fakeip_range)
     results["fake-ip"] = fk_ok
 
-    # ④ echo 出口 IP + 白名单三分法
-    echo = netprobe.probe_echo_endpoints(list(config.echo_endpoints))
+    # ④ echo 出口 IP + ⑤ DNS 出口探针：互相独立，并发执行（wall time =
+    # max 而非 sum，--check 实测省 ~3-6s）。⑤ 的 try/except（P3-12a：
+    # 底层解析异常按"探测不可达"展示，不下"已放行"）包在线程函数内。
+    # load 已保证 dns_whitelist 有值（键缺失回退 whitelist），不再 or 链。
+    def _dns_probe():
+        try:
+            return dnscheck.check_dns_egress(
+                config.dns_probe_domain,
+                list(config.dns_whitelist),
+                list(config.dns_egress_countries))
+        except Exception as exc:
+            return policy.UNREACHABLE, dnscheck.DnsEgressResult(
+                ok=False, error=str(exc))
+
+    with ThreadPoolExecutor(max_workers=2,
+                            thread_name_prefix="selfcheck-probe") as ex:
+        fut_echo = ex.submit(netprobe.probe_echo_endpoints,
+                             list(config.echo_endpoints))
+        fut_dns = ex.submit(_dns_probe)
+        echo = fut_echo.result()
+        dns_verdict, dns_probe = fut_dns.result()
+
     echo_ok = echo.ok
     results["echo出口"] = echo_ok
     if echo.ok:
@@ -1198,18 +1226,6 @@ def selfcheck(config: Config, logger: logging.Logger | None = None) -> int:
 
     fast_ok = mihomo and tun_ok
 
-    # ⑤ DNS 出口探针：递归出口不在白名单 → 泄漏，与出口脏同权
-    # load 已保证 dns_whitelist 有值（键缺失回退 whitelist），不再 or 链。
-    # P3-12a：底层解析异常（如 struct.error）在守护路径有 UNREACHABLE 兜底，
-    # selfcheck 同样不得 traceback——异常按"探测不可达"展示，不下"已放行"。
-    try:
-        dns_verdict, dns_probe = dnscheck.check_dns_egress(
-            config.dns_probe_domain,
-            list(config.dns_whitelist),
-            list(config.dns_egress_countries))
-    except Exception as exc:
-        dns_verdict, dns_probe = policy.UNREACHABLE, dnscheck.DnsEgressResult(
-            ok=False, error=str(exc))
     dns_leak_ip = dns_probe.egress_ip if dns_probe.ok else None
     # 三态：True=干净 False=泄漏 None=探测不可达（不可达≠泄漏，
     # 曾映射成 False 被显示为"未通过"）。

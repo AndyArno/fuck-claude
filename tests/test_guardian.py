@@ -2028,3 +2028,44 @@ class TestFwPersistentFailure:
         fw.calls.clear()
         g._self_heal_rules()
         assert fw.calls.count("enable_fakeip") == 3  # 下轮照常尝试
+
+
+class TestSlowPathProbeConcurrency:
+    """慢路径 echo 与 DNS 探针并发：互相独立，wall time = max 而非 sum。"""
+
+    def test_echo_and_dns_probes_overlap(self, tmp_path):
+        import socket as s
+
+        barrier = threading.Barrier(2)
+        serial = []
+
+        class BarrierNp(FakeNetprobe):
+            def probe_echo_endpoints(self, endpoints):
+                try:
+                    barrier.wait(timeout=2)
+                except threading.BrokenBarrierError:
+                    serial.append("echo")
+                return super().probe_echo_endpoints(endpoints)
+
+        class BarrierDns(FakeDns):
+            def check_dns_egress(self, domain, whitelist, allowed_countries=None):
+                try:
+                    barrier.wait(timeout=2)
+                except threading.BrokenBarrierError:
+                    serial.append("dns")
+                return super().check_dns_egress(domain, whitelist, allowed_countries)
+
+        g, fw, *_ = make_guardian(tmp_path, np=BarrierNp(), dns=BarrierDns())
+        real = s.getaddrinfo
+        s.getaddrinfo = lambda h, *a, **k: [(2, 1, 6, "", ("198.18.0.1", 0))]
+        try:
+            local = guardian.netprobe.LocalEnvResult(
+                mihomo_running=True, tun_present=True, error=None)
+            event = g._slow_path(local)
+        finally:
+            s.getaddrinfo = real
+        # 并发执行：两个探针都在 barrier 等到对方（串行必 broken）
+        assert serial == []
+        # 功能不受影响：双 CLEAN → 放行计数 +1（首轮未到阈值无事件）
+        assert event is None
+        assert g._counter.pass_streak == 1
