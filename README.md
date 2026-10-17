@@ -78,6 +78,11 @@ PowerShell）。
 （其 heal 线程会在 30 秒内把规则改回去，白切）；运行期间请用托盘的
 「暂停守护 / 临时放行」。
 
+> ⚠ **警示**：选择「关闭拦截（放行）」时，脚本会单独二次确认是否停用
+> `CG-V6`。CG-V6 是 IPv6 侧的永久防线（守护无权停用它），一旦确认停用，
+> IPv6 出口将**完全失去保护**——除非你明确知道自己不需要 IPv6 防线，
+> 否则请在二次确认时输入非 Y 保留 CG-V6 拦截。
+
 ## 卸载
 
 管理员 PowerShell 执行：
@@ -96,7 +101,7 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 
 1. **看托盘颜色**
    - 🔴 红（阻断）：五项检查未全过，门禁正在阻断——这是设计行为。
-   - 🟡 黄（探测中/暂停/漂移）：检查进行中，或配置了漂移告警（看日志确认）。
+   - 🟡 黄（探测中/暂停/漂移/临时放行 override）：检查进行中，守护被暂停，配置了漂移告警，或处于托盘"临时放行"窗口（看日志确认）。
    - 🟢 绿（放行）：门禁认为链路正常，问题不在此工具（查 mihomo/节点本身）。
    - 图标消失：程序未运行。`Start-ScheduledTask -TaskName ClaudeGuard` 手动启动。
 
@@ -116,8 +121,9 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 |---|---|
 | `blocked_cidrs_v4` | 封禁的 Claude IPv4 段（CG-Global 封这些段） |
 | `blocked_cidrs_v6` | 封禁的 IPv6 段（CG-V6 全封，门禁无权放行） |
-| `rule_name_v4` / `rule_name_v6` | 防火墙规则名（默认 CG-Global / CG-V6，改名前先卸载旧规则） |
+| `rule_name_v4` / `rule_name_v6` / `rule_name_fakeip` | 防火墙规则名（默认 CG-Global / CG-V6 / CG-FakeIP，改名前先卸载旧规则） |
 | `whitelist` | ④连接出口白名单 IP/CIDR：echo 出口命中即放行。**编辑保存即热生效，无需重启** |
+| `dns_probe_domain` | ⑤DNS 出口探针域名（默认 `whoami.ds.akahelp.net`，向其发 TXT 查询取 ECS 网段） |
 | `echo_endpoints` | 探测出口 IP 的 HTTP 端点。**必须与 Claude 同分流组**（否则测错路径）；`/cdn-cgi/trace` 结尾自动用 trace 解析 |
 | `dns_whitelist` | ⑤解析出口精确段白名单（缺省复用 `whitelist`）。段命中直接判干净，优先于国家 |
 | `dns_egress_countries` | ⑤解析出口归属国白名单（ISO 3166-1 两位码，如 `["US"]`）：ECS/出口落地国在列表内=干净。换同国节点免改配置；配空则仅用段判定 |
@@ -128,7 +134,7 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 | `pass_confirm_count` | 连续通过 N 次慢检查才放行（防抖动） |
 | `fail_unreachable_threshold` | 出口不可达连续 N 次升级为阻断 |
 | `doh_check_interval_min` / `ripe_check_interval_hours` | 漂移监控（DoH / RIPE）周期 |
-| `override_minutes` | 托盘"临时放行"时长（分钟），期间全程审计日志 |
+| `override_minutes` | 托盘"临时放行"时长（分钟数来自此配置，默认 30），期间全程审计日志（时间/时长；原因选项不做） |
 | `claude_domains` | 漂移检测的域名列表 |
 | `asn` | RIPE 查询的 ASN（如 AS399358） |
 | `log_dir` / `log_retention_days` | 日志目录 / 按天滚动保留天数 |

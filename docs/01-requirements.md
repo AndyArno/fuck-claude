@@ -25,10 +25,10 @@
 | B-1 | 默认阻断本机所有进程到 Anthropic IPv4 段（160.79.104.0/23）的出站连接（门控规则 CG-Global，随门禁切换）；配套门控规则 **CG-FakeIP** 阻断 claude 域名当前解析到的 fake-ip（198.18.x.x）地址，掐断"浏览器 → fake-ip → TUN → mihomo → 代理"这条绕过 CG-Global 的泄漏路径——DNS 泄漏（ECS 带真实网段）恰恰发生在使用过程中，必须让连接根本到不了 mihomo | 规则 Enabled 时，Edge 打不开 claude.ai、omp 无法调用 Claude API、Claude Code 无法连接 |
 | B-2 | 阻断不依赖代理进程存活（内核级 WFP 规则） | 杀掉 verge-mihomo.exe 后阻断仍然有效 |
 | B-3 | 阻断不影响其他任何流量 | 阻断态下 YouTube、GitHub、游戏、其他模型商 API 全部正常 |
-| B-4 | 规则状态切换（Enable/Disable）。实测经 PowerShell cmdlet 单次调用 ~1.6–3s（修订：原"<100ms"基于 WFP API 直调，当前实现走 PS 子进程不可达，见架构 §8） | 切换在 3s 内完成；切换期间规则不会处于"半开"状态（cmdlet 原子生效） |
-| B-5 | 工具崩溃/被杀时，规则停留在阻断态（fail-closed） | 强杀工具进程，Claude 仍不可达 |
+| B-4 | 规则状态切换（Enable/Disable）。实测：netsh 快车道 ~0.4s/次；PowerShell cmdlet 回退路径 2.7–3.8s/次（原"<100ms"基于 WFP API 直调，当前实现不可达，见架构 §8） | 切换在 4s 内完成（快车道 ~0.4s；回退路径实测 2.7–3.8s）；切换期间规则不会处于"半开"状态（cmdlet 原子生效） |
+| B-5 | **阻断态下**工具崩溃/被杀时，规则停留在阻断态（fail-closed）。放行态（含 override 窗口）强杀/退出无组件恢复 Enabled，残余风险见架构 §8 | 阻断态下强杀工具进程，Claude 仍不可达 |
 | B-6 | **Anthropic IPv6 段（2607:6bc0::/48、2607:6bc0:11::/48）永久封死**：独立规则 CG-V6，常驻 Enabled，门禁永远无权放行。理由：代理走 IPv4，任何到 Claude 的 v6 连接必然是绕过代理的直连（防系统 IPv6 被误重新启用后 AAAA 直连） | 规则 CG-V6 存在且 Enabled；门禁任何状态下 IPv6 直连 claude.ai 均不可达 |
-| B-7 | Clash 内核关闭必须**立即**阻断（快路径，纯本地进程/网卡检查，1s 周期，不等待网络探测） | Clash 死亡后 ≤2 秒内 Claude 不可达（29/30 的快路径 tick 满足；含自愈 PS 调用的 tick 最坏 ~4–5s，见架构 §8 残余） |
+| B-7 | Clash 内核关闭必须**立即**阻断（快路径，纯本地进程/网卡检查，1s 周期，不等待网络探测） | Clash 死亡后 FAST_FAIL 端到端 ≤1.5s 内 Claude 不可达（阻断动作 netsh 快车道实测 ~0.4s；29/30 的快路径 tick 满足；含自愈 PS 调用的 tick 最坏 ~4–5s，见架构 §8 残余） |
 
 ### 3.2 放行需求（门禁）
 
@@ -58,7 +58,7 @@
 | T-2 | 悬停提示显示当前状态摘要（出口 IP、检查项结果） | 鼠标悬停可见 |
 | T-3 | 菜单：状态详情 / 临时放行(30 分钟 override) / 暂停守护 / 编辑白名单 / 退出 | 全部菜单项可用 |
 | T-4 | 状态变化时 Windows Toast 通知 | 放行↔阻断切换时弹通知 |
-| T-5 | override（临时放行）带审计日志（时间、原因选项） | 日志文件可查 |
+| T-5 | override（临时放行）带审计日志（只记时间/时长；原因选项不做） | 日志文件可查（时间、时长） |
 | T-6 | 退出即恢复阻断并清理（规则保持 Enabled，进程退出） | 退出后 Claude 不可达 |
 
 ### 3.5 部署需求
@@ -108,7 +108,7 @@
 ## 7. 验收标准（端到端场景）
 
 1. Clash 正常 + 出口白名单内：Claude 三种方式全部可用（绿灯）
-2. 关闭 Clash：**≤2 秒**内 Claude 全部不可达（快路径，红灯 + Toast）
+2. 关闭 Clash：FAST_FAIL 端到端 ≤1.5s 内 Claude 全部不可达（快路径 + netsh 快车道，红灯 + Toast；秒表口径：从结束 mihomo 进程到 Claude 连接被拒）
 3. 忘开 Clash 启动 Claude：连接直接失败，零流量出站
 4. Clash 开启但出口 IP 不在白名单：保持阻断，托盘提示原因
 5. 托盘 override：30 分钟内放行，自动恢复阻断，日志有记录
