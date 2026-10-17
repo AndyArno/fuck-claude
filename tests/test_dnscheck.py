@@ -524,3 +524,22 @@ class TestTxtCountGuard:
         result = dnscheck.query_txt_windows("whoami.ds.akahelp.net")
         assert result.ok is False
         assert "no TXT records parsed" in (result.error or "")
+
+
+def test_check_fakeip_default_resolver_queries_ipv4_only(monkeypatch):
+    """默认解析器只发 A 查询：AAAA 在 fake-ip 判定中无意义（段是 IPv4），
+    且显式 AAAA 查询绕过 mihomo 本地应答走上游递归，实测单发 stall 8-11s
+    （慢轮间隔 17.5s 的隐藏成本，曾每轮都付）。"""
+    import socket as s
+    from winplat import dnscheck
+
+    families = []
+
+    def fake_getaddrinfo(host, port, family, *a, **k):
+        families.append(family)
+        return [(2, 1, 6, "", ("198.18.0.7", 0))]
+
+    monkeypatch.setattr(dnscheck.socket, "getaddrinfo", fake_getaddrinfo)
+    r = dnscheck.check_fakeip("claude.ai", "198.18.0.0/15")
+    assert r.ok and r.in_fakeip_range
+    assert families and set(families) == {s.AF_INET}

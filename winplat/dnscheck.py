@@ -109,16 +109,20 @@ class DnsEgressResult:
     error: str | None = None
 
 
-def getaddrinfo_ips(hostname: str) -> tuple[str, ...]:
-    """getaddrinfo 解析主机名的全部唯一 IP（A+AAAA）。纯解析辅助，可注入测试。"""
+def getaddrinfo_a(hostname: str) -> tuple[str, ...]:
+    """getaddrinfo 仅查 A 记录。纯解析辅助，可注入测试。
+
+    不查 AAAA：fake-ip 判定是 IPv4 概念（198.18.0.0/15），AAAA 结果
+    永不落在段内，纯浪费；且显式 AAAA 查询在 fake-ip 环境下会绕过
+    mihomo 本地应答走上游递归，用户网络实测单发 stall 8-11s（慢轮
+    间隔 17.5s 的隐藏成本）。"""
     results: list[str] = []
-    for family in (socket.AF_INET, socket.AF_INET6):
-        try:
-            infos = socket.getaddrinfo(hostname, None, family)
-        except socket.gaierror:
-            continue
-        for info in infos:
-            results.append(info[4][0])
+    try:
+        infos = socket.getaddrinfo(hostname, None, socket.AF_INET)
+    except socket.gaierror:
+        return ()
+    for info in infos:
+        results.append(info[4][0])
     # 保序去重
     seen: set[str] = set()
     unique = []
@@ -144,7 +148,7 @@ def check_fakeip(
         return FakeIpResult(ok=False, resolved_ips=(), in_fakeip_range=False, error=f"bad fakeip_range: {exc}")
 
     if resolver is None:
-        resolver = getaddrinfo_ips
+        resolver = getaddrinfo_a
     try:
         ips = resolver(hostname)
     except OSError as exc:
