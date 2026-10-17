@@ -25,6 +25,7 @@ import logging
 import logging.handlers
 import os
 import queue
+import re
 import threading
 import time
 from pathlib import Path
@@ -62,6 +63,12 @@ def setup_logging(config: Config, logger: logging.Logger | None = None) -> loggi
     # 滚动文件名 guard-YYYYMMDD.log（需求 P-4 / 架构 §6）
     handler.suffix = "%Y%m%d"
     handler.namer = _guard_namer
+    # P2-8：自定义 namer 后 extMatch 仍是默认 "^\d{4}-\d{2}-\d{2}"，
+    # getFilesToDelete 恒空 → 保留期清理失效。namer 路径下 getFilesToDelete
+    # 用 extMatch.search 在完整文件名（guard-20261001.log）内找日期戳并
+    # 回放 namer 验证——^ 锚定永不命中、m[0] 带 ".log" 又会破坏 namer 的
+    # rpartition，故用"8 位日期戳 + .log 前瞻"（实测命中）。
+    handler.extMatch = re.compile(r"\d{8}(?=\.log$)")
     handler.setFormatter(logging.Formatter(
         "%(asctime)s %(levelname)s [%(threadName)s] %(message)s"))
     log.addHandler(handler)
@@ -161,6 +168,11 @@ class Guardian:
         # 也放独立线程（failip-refresh），绝不阻塞主循环快路径。
         self._fakeip_wake = threading.Event()  # 主循环 → refresh 线程：立即刷新
         self._fakeip_thread: threading.Thread | None = None
+        # P2-5：慢路径/热重载在 tick 内只登记新集合，重建由 fakeip-refresh
+        # 线程消费（tick 内零 create_rule_fakeip）
+        self._fakeip_pending: tuple[str, ...] | None = None
+        # P2-5：热重载只置标志，封禁规则重建由 heal 线程执行
+        self._pending_rebuild: tuple[bool, bool] | None = None  # (v4, v6)
 
         self._tick_count = 0
         self._slow_every = max(
@@ -261,7 +273,9 @@ class Guardian:
 
         # ③ 暂停守护：只停“检查”，不放弃已有安全职责——
         #   - override 到期判断照常（否则 override+暂停 = 无限期放行）
-        #   - CG-V6 每轮强制 Enabled 照常（B-6 与暂停无关）
+        #   - CG-V6 永久 Enabled 由 heal 线程每 30s 无条件 ensure（暂停
+        #     照常跑，B-6 与暂停无关）——P2-5：不再 per-tick 直调 PS，
+        #     暂停态 tick 零 PowerShell 子进程
         #   - 规则冻结在阻断态（pause 命令处理时已 enable）
         if self.paused:
             if self._gstate.on_override and self.override_until is not None \
@@ -271,11 +285,6 @@ class Guardian:
                 self.override_until = None
                 self._counter.reset()
                 self._apply_event(sm.OVERRIDE_EXPIRE)
-            try:
-                with self._fw_lock:
-                    self.fw.ensure_enabled_v6(self.config)
-            except Exception as exc:
-                self.log.warning("暂停期间 CG-V6 ensure 失败：%s", exc)
             self._push_tray()
             return True
 
@@ -328,7 +337,8 @@ class Guardian:
         return collect_fakeips(self.config, self.log)
 
     def _refresh_fakeip_rule(self) -> None:
-        """慢路径每轮调用：重解析 fake-ip 集合，变化时重建 CG-FakeIP。
+        """慢路径每轮调用：重解析 fake-ip 集合，变化时唤醒
+        fakeip-refresh 线程重建（P2-5：tick 内不再直调 PS 子进程）。
 
         fake-ip 映射会因 mihomo 重启/缓存淘汰变化（RemoteAddress 只在
         create 时写入，必须重建规则）。采集为空（Clash 死了，getaddrinfo
@@ -339,12 +349,11 @@ class Guardian:
         if not ips:
             self.log.info("fake-ip 集合为空，CG-FakeIP 保持现状")
             return
-        if self._fw_tolerant("create_rule_fakeip", list(ips)):
-            self._fakeip_rule_ips = ips
-            # create 后规则默认 Enabled；放行态下须恢复 Disabled
-            if self._gstate.state == sm.ALLOWED or self._gstate.on_override:
-                self._fw_tolerant("disable_fakeip")
-            self.log.info("CG-FakeIP 已更新（%d 个 fake-ip）", len(ips))
+        # 集合无变化不置 _fakeip_pending（避免每 5s 白唤醒重建）；有变化
+        # 只登记新集合 + 唤醒线程，create_rule_fakeip 由该线程持 _fw_lock
+        # 执行（与 heal 线程按次互斥，语义与原 tick 内重建一致）。
+        self._fakeip_pending = ips
+        self._fakeip_wake.set()
 
     # ------------------------------------------------------------------ 检查路径
 
@@ -434,8 +443,9 @@ class Guardian:
 
     @property
     def dns_whitelist(self) -> list[str]:
-        """DNS 出口白名单：dns_whitelist 优先，缺省复用 echo 出口 whitelist。"""
-        return list(self.config.dns_whitelist or self.config.whitelist)
+        """DNS 出口白名单：直接用 cfg.dns_whitelist（load 已保证有值：
+        键存在（含显式 []）→ 用之；缺失 → 已回退 whitelist）。"""
+        return list(self.config.dns_whitelist)
 
     def _check_fakeip(self) -> bool:
         try:
@@ -589,7 +599,11 @@ class Guardian:
         try:
             with self._fw_lock:
                 self.fw.ensure_exists(self.config)
-            self.log.info("防火墙预热完成（CG-Global ensure_exists）")
+                # P2-7：ensure_exists 不改 Enabled 态——上次放行态强杀残留
+                # Disabled 时存在 ~5-13s 未阻断窗口。启动初态恒阻断，
+                # set_blocking(True)（netsh 快车道 ~0.4s）立即封死。
+                self.fw.set_blocking(self.config, True)
+            self.log.info("防火墙预热完成（CG-Global ensure_exists + 阻断态）")
         except Exception as exc:
             self.log.error("防火墙预热失败（将继续，由自愈兜底）：%s", exc)
         try:
@@ -628,18 +642,31 @@ class Guardian:
             if self._heal_wake.wait(timeout=delay):
                 self._heal_wake.clear()
 
+    def _rebuild_fakeip_rule(self, ips: tuple[str, ...]) -> None:
+        """重建 CG-FakeIP 为 ips（fakeip-refresh 线程执行，P2-5）。
+        create 后规则默认 Enabled；放行态下须恢复 Disabled。"""
+        if self._fw_tolerant("create_rule_fakeip", list(ips)):
+            self._fakeip_rule_ips = ips
+            if self._gstate.state == sm.ALLOWED or self._gstate.on_override:
+                self._fw_tolerant("disable_fakeip")
+            self.log.info("CG-FakeIP 已更新（%d 个 fake-ip）", len(ips))
+
     def _fakeip_refresh_loop(self) -> None:
-        """fake-ip 刷新线程：平时随慢路径节奏（_slow_path 每轮已调用
-        _refresh_fakeip_rule）；状态迁移时被 _fakeip_wake 唤醒立即重采集
-        重建 CG-FakeIP。阻塞型迁移场景（如暂停/恢复期间无慢路径）也由本
-        线程兜底。异常续命，永不退出（除 stop）。"""
+        """fake-ip 刷新线程：状态迁移时被 _fakeip_wake 唤醒；慢路径检测到
+        集合变化也登记 _fakeip_pending 后唤醒（P2-5：重建动作全部收敛到
+        本线程，主循环 tick 内零 PS 直调）。先消费 _fakeip_pending（热重载
+        /慢路径已重采集的新集合），无 pending 才自己重采集（迁移点）。"""
         while not self._stop.is_set():
             if self._fakeip_wake.wait():
                 self._fakeip_wake.clear()
             if self._stop.is_set():
                 return
             try:
-                self._refresh_fakeip_rule()
+                pending, self._fakeip_pending = self._fakeip_pending, None
+                if pending is not None:
+                    self._rebuild_fakeip_rule(pending)
+                else:
+                    self._refresh_fakeip_rule()
             except Exception as exc:
                 self.log.warning("迁移后 fake-ip 刷新失败（慢路径重试）：%s", exc)
 
@@ -650,6 +677,14 @@ class Guardian:
         PowerShell 调用持 _fw_lock，与主循环的 enable/disable 按次互斥。
         get_status / ensure_enabled_v6 为只读/幂等校验，裸调用后整体关闭，
         保证读取与写入的规则状态一致。"""
+        # P2-5：热重载登记的封禁规则重建（代际变化）——heal 线程执行，
+        # 主循环 tick 内零 PS 直调。重建后 CG-V6 强制 Enabled（_rebuild_
+        # blocked_rules 语义保留）；失败时旧规则仍在（create 覆盖式重建
+        # 失败不删规则），下轮 heal 兜底，fail-closed。
+        if self._pending_rebuild is not None:
+            v4, v6 = self._pending_rebuild
+            self._pending_rebuild = None
+            self._rebuild_blocked_rules(v4, v6)
         # 暂停 = 冻结阻断：期望恒为 Enabled（heal 线程与暂停语义对齐，
         # 防 override 残留标志导致 heal 反向放行规则）。
         expected_enabled = self.paused or not (
@@ -911,16 +946,19 @@ class Guardian:
             changed.append(f"whitelist={new_cfg.whitelist}")
         # 封禁段变化必须重建 WFP 规则（RemoteAddress 只在 create 时写入），
         # 否则日志“已更新”但规则仍封旧 CIDR（H5 断点）。
+        # P2-5：tick 内不再直调 PS——只置标志 + 唤醒 heal 线程，由其检测
+        # 配置代际变化后执行重建（重建后 CG-V6 强制 Enabled，失败不破坏
+        # 旧规则：heal 线程按期望状态恢复，fail-closed）。
         if v4_changed or v6_changed:
-            self._rebuild_blocked_rules(v4_changed, v6_changed)
-        # claude_domains / fakeip_range 变化：CG-FakeIP 内容随之失效，立即
-        # 按新配置重采集重建（放行态下重建为 Disabled，下轮迁移 enable 生效）。
+            self._pending_rebuild = (v4_changed, v6_changed)
+            self._heal_wake.set()
+        # claude_domains / fakeip_range 变化：CG-FakeIP 内容随之失效，置
+        # None 强制视为变化 + 唤醒 fakeip-refresh 线程重采集重建（tick 内
+        # 零 PS；放行态下重建为 Disabled，下轮迁移 enable 生效）。
         if domains_changed or fakeip_range_changed:
             self._fakeip_rule_ips = None  # 强制视为变化
-            try:
-                self._refresh_fakeip_rule()
-            except Exception as exc:
-                self.log.warning("CG-FakeIP 热重载重建失败（慢路径重试）：%s", exc)
+            self._fakeip_pending = None   # 让 refresh 线程自己重采集
+            self._fakeip_wake.set()
         self.log.info("配置热重载完成 %s", "；".join(changed) or "（无字段变化）")
 
     def _rebuild_blocked_rules(self, v4: bool, v6: bool) -> None:
@@ -1115,9 +1153,11 @@ def selfcheck(config: Config, logger: logging.Logger | None = None) -> int:
     fast_ok = mihomo and tun_ok
 
     # ⑤ DNS 出口探针：递归出口不在白名单 → 泄漏，与出口脏同权
+    # load 已保证 dns_whitelist 有值（键缺失回退 whitelist），不再 or 链
     dns_verdict, dns_probe = dnscheck.check_dns_egress(
         config.dns_probe_domain,
-        list(config.dns_whitelist or config.whitelist))
+        list(config.dns_whitelist),
+        list(config.dns_egress_countries))
     dns_leak_ip = dns_probe.egress_ip if dns_probe.ok else None
     # 三态：True=干净 False=泄漏 None=探测不可达（不可达≠泄漏，
     # 曾映射成 False 被显示为"未通过"）。

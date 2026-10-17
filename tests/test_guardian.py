@@ -38,6 +38,8 @@ class FakeFirewall:
         self.fakeip_enabled: bool | None = None  # None = 规则不存在
         self.fakeip_ips: list[str] = []
         self.calls: list[str] = []
+        # P2-5 验收：记录 (method, 调用线程名)，断言 tick 线程内零 PS 直调
+        self.threaded_calls: list[tuple[str, str]] = []
         # P1-4：可控持续失败注入（如 {"set_blocking"}）——模拟 PS 权限
         # 拒绝/防火墙服务异常，验证失败路径（_fw_tolerant 耗尽/heal 重试）。
         self.fail_methods: set = fail_methods or set()
@@ -47,15 +49,18 @@ class FakeFirewall:
 
     def create_rule(self, config) -> None:
         self.calls.append("create_rule")
+        self.threaded_calls.append(("create_rule", threading.current_thread().name))
         self.missing = False
         self.global_enabled = True
 
     def enable(self, config) -> None:
         self.calls.append("enable")
+        self.threaded_calls.append(("enable", threading.current_thread().name))
         self.global_enabled = True
 
     def disable(self, config) -> None:
         self.calls.append("disable")
+        self.threaded_calls.append(("disable", threading.current_thread().name))
         self.global_enabled = False
 
     def set_blocking(self, config, blocking: bool) -> None:
@@ -65,6 +70,7 @@ class FakeFirewall:
         语义对齐真实复查：CG-Global 必达目标态；CG-FakeIP 缺失（None）
         时跳过（幂等）。"""
         self.calls.append("set_blocking_on" if blocking else "set_blocking_off")
+        self.threaded_calls.append(("set_blocking_on" if blocking else "set_blocking_off", threading.current_thread().name))
         self.global_enabled = blocking
         if self.fail_on("set_blocking"):
             raise FirewallError("set_blocking denied")
@@ -75,6 +81,7 @@ class FakeFirewall:
         """退出路径批量恢复阻断（单 PS 优化路径）：等价 ensure+enable
         两规则；fakeip_ips 为空时不碰 FakeIP 规则。"""
         self.calls.append("block_all")
+        self.threaded_calls.append(("block_all", threading.current_thread().name))
         self.ensure_exists(config)
         self.enable(config)
         if fakeip_ips:
@@ -83,6 +90,7 @@ class FakeFirewall:
 
     def get_status(self, config):
         self.calls.append("get_status")
+        self.threaded_calls.append(("get_status", threading.current_thread().name))
         if self.missing:
             return "MISSING"
         if self.status_mode == "tristate":
@@ -91,17 +99,20 @@ class FakeFirewall:
 
     def ensure_exists(self, config) -> None:
         self.calls.append("ensure_exists")
+        self.threaded_calls.append(("ensure_exists", threading.current_thread().name))
         self.missing = False
 
     # -------- CG-FakeIP（门控规则：与 CG-Global 同步 enable/disable）
 
     def create_rule_fakeip(self, config, ips) -> None:
         self.calls.append("create_rule_fakeip")
+        self.threaded_calls.append(("create_rule_fakeip", threading.current_thread().name))
         self.fakeip_ips = list(ips)
         self.fakeip_enabled = True
 
     def enable_fakeip(self, config) -> None:
         self.calls.append("enable_fakeip")
+        self.threaded_calls.append(("enable_fakeip", threading.current_thread().name))
         if self.fail_on("enable_fakeip"):
             raise FirewallError("enable_fakeip denied")
         if self.fakeip_enabled is None:
@@ -110,26 +121,31 @@ class FakeFirewall:
 
     def disable_fakeip(self, config) -> None:
         self.calls.append("disable_fakeip")
+        self.threaded_calls.append(("disable_fakeip", threading.current_thread().name))
         if self.fakeip_enabled is None:
             return  # MISSING 幂等（对齐真实 disable_fakeip）
         self.fakeip_enabled = False
 
     def get_status_fakeip(self, config):
         self.calls.append("get_status_fakeip")
+        self.threaded_calls.append(("get_status_fakeip", threading.current_thread().name))
         if self.fakeip_enabled is None:
             return "MISSING"
         return "ENABLED" if self.fakeip_enabled else "DISABLED"
 
     def ensure_exists_fakeip(self, config, ips) -> None:
         self.calls.append("ensure_exists_fakeip")
+        self.threaded_calls.append(("ensure_exists_fakeip", threading.current_thread().name))
         if self.fakeip_enabled is None:
             self.create_rule_fakeip(config, ips)
 
     def create_rule_v6(self, config) -> None:
         self.calls.append("create_rule_v6")
+        self.threaded_calls.append(("create_rule_v6", threading.current_thread().name))
 
     def ensure_enabled_v6(self, config) -> None:
         self.calls.append("ensure_enabled_v6")
+        self.threaded_calls.append(("ensure_enabled_v6", threading.current_thread().name))
 
 
 
@@ -237,7 +253,11 @@ def make_config(**over) -> Config:
         asn="AS399358",
         log_dir="logs",
         log_retention_days=30,
+        # P2-3 接口契约：load() 保证 dns_whitelist 恒有值（键缺失回退
+        # whitelist）。测试直接构造 Config 不走 load，这里按同语义补齐；
+        # 显式传 dns_whitelist=...（含 []）时尊重显式值。
     )
+    base.setdefault("dns_whitelist", list(base["whitelist"]))
     base.update(over)
     return Config(**base)
 
@@ -458,15 +478,20 @@ class TestCommands:
         assert np.local_calls > before_local
 
     def test_pause_still_enforces_v6_and_override_expiry(self, tmp_path):
-        """H3：暂停期间 CG-V6 ensure 与 override 到期判断照常执行。"""
+        """H3：暂停期间 override 到期判断照常；P2-5 后 tick 内零 PS——
+        CG-V6 ensure 由 heal 线程每 30s 无条件执行（暂停时照常跑）。"""
         g, fw, *_ , clock = make_guardian(tmp_path)
         clock.advance(1000)
         g.handle_command("override_30min")
         g.handle_command("pause")
-        # 30s 周期到：暂停期间 v6 ensure 照常
+        # P2-5：暂停态 tick 内不再 per-tick ensure_enabled_v6（零 PS 直调）
         fw.calls.clear()
         clock.advance(31)
         g.tick()
+        assert "ensure_enabled_v6" not in fw.calls
+        assert "create_rule" not in fw.calls
+        # heal 线程暂停时仍无条件 ensure CG-V6（B-6 语义保留）
+        g._self_heal_rules()
         assert "ensure_enabled_v6" in fw.calls
         # override 到期：暂停期间也恢复阻断
         clock.advance(30 * 60 + 1)
@@ -881,6 +906,163 @@ class TestLogging:
     def test_namer(self):
         assert guardian._guard_namer("guard.log.20261015") == "guard-20261015.log"
 
+    def test_log_retention_cleanup_matches_namer_output(self, tmp_path):
+        """P2-8：自定义 namer 后 extMatch 须匹配 8 位日期戳，否则
+        getFilesToDelete 恒空、保留期清理失效（曾实测复现）。"""
+        import logging.handlers
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        old = log_dir / "guard-20261001.log"   # 旧 → 应进删除列表
+        new = log_dir / "guard-20990101.log"   # 新 → 保留
+        current = log_dir / "guard.log"
+        for f in (old, new, current):
+            f.write_text("", encoding="utf-8")
+        cfg = make_config(log_dir=str(log_dir), log_retention_days=1)
+        log = guardian.setup_logging(cfg, logger=logging.getLogger("test-log-p28"))
+        handler = log.handlers[0]
+        assert isinstance(handler, logging.handlers.TimedRotatingFileHandler)
+        # extMatch 已按 namer 产物修正（默认 ^\d{4}-\d{2}-\d{2}$ 永不命中）
+        assert handler.extMatch.search("guard-20261001.log")
+        assert not handler.extMatch.search("guard-notastamp.log")  # 非 8 位日期戳不误匹配
+        to_delete = list(handler.getFilesToDelete())
+        assert str(old) in to_delete
+        assert str(new) not in to_delete
+        handler.close()
+
+
+class TestPreheat:
+    def test_preheat_ensures_blocking_state(self, tmp_path):
+        """P2-7：上次放行态强杀残留 Disabled 时，preheat 必须在启动期
+        set_blocking(True) 封死（ensure_exists 不改 Enabled 态）。"""
+        fw = FakeFirewall(global_enabled=False)  # 残留放行态
+        fw.fakeip_enabled = False
+        g, *_ , _ = make_guardian(tmp_path, fw=fw)
+        # 直接跑 preheat（make_guardian 已把 g._preheat 替换为 no-op，还原）
+        g._preheat = Guardian._preheat.__get__(g)
+        import socket as s
+        real = s.getaddrinfo
+        s.getaddrinfo = lambda h, *a, **k: [(2, 1, 6, "", ("198.18.0.1", 0))]
+        try:
+            g._preheat()
+        finally:
+            s.getaddrinfo = real
+        assert g.fw.global_enabled is True
+        assert "set_blocking_on" in g.fw.calls
+        # ensure_exists 在 set_blocking 之前（先补缺再置态）
+        assert g.fw.calls.index("ensure_exists") \
+            < g.fw.calls.index("set_blocking_on")
+
+    def test_preheat_blocking_not_broken_by_allowed_gstate(self, tmp_path):
+        """启动初态恒 BLOCKED：即使 Guardian 状态字段默认值异常，preheat
+        也无条件置阻断（P2-7 验收：pause/ALLOWED 初始态不影响）。"""
+        fw = FakeFirewall(global_enabled=False)
+        g, *_ , _ = make_guardian(tmp_path, fw=fw)
+        g._gstate = sm.GateState(state=sm.ALLOWED)  # 残留期望 Disabled
+        g._preheat = Guardian._preheat.__get__(g)
+        g._preheat()
+        assert fw.global_enabled is True   # 启动期无条件阻断
+
+
+# ----------------------------------------------------------------- P2-5 tick 内零 PS
+
+def _calls_by_thread(fw):
+    """按方法名归纳调用线程名（FakeFirewall 记录 (method, thread)。"""
+    out: dict[str, set] = {}
+    for method, thread in fw.threaded_calls:
+        out.setdefault(method, set()).add(thread)
+    return out
+
+
+class TestNoPsInTick:
+    """P2-5：tick（guardian-main 线程）内不得出现 create_rule*/ensure_enabled_v6；
+    重建最终仍发生（heal / fakeip-refresh 线程）。"""
+
+    def test_paused_tick_zero_ps(self, tmp_path):
+        """场景①暂停态：tick 内零 PS（v6 ensure 交给 heal 线程）。"""
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        g.handle_command("pause")
+        fw.threaded_calls.clear()
+        fw.calls.clear()
+        g.tick()
+        assert _calls_by_thread(fw).get("ensure_enabled_v6", set()) == set()
+        assert not fw.threaded_calls   # 暂停态 tick 整体零 PS
+
+    def test_slow_path_fakeip_change_rebuild_in_refresh_thread(self, tmp_path):
+        """场景②慢路径 fake-ip 集合变化：tick 内无 create_rule_fakeip，
+        重建发生在 fakeip-refresh 线程。"""
+        import socket as s
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        g._gstate = sm.GateState(state=sm.BLOCKED)
+        fw.fakeip_enabled = True
+        g._fakeip_rule_ips = ("198.18.0.1",)
+        fw.fakeip_ips = ["198.18.0.1"]
+        current = {"ips": ["198.18.0.9"]}
+        real = s.getaddrinfo
+        s.getaddrinfo = lambda h, *a, **k: [
+            (2, 1, 6, "", (ip, 0)) for ip in current["ips"]]
+        g._fakeip_thread = threading.Thread(
+            target=g._fakeip_refresh_loop, name="fakeip-refresh", daemon=True)
+        g._fakeip_thread.start()
+        try:
+            g._tick_count = 4
+            g.tick()   # 慢路径：检测到变化，tick 内不得直调 PS
+            threads = _calls_by_thread(fw)
+            assert "guardian-main" not in threads.get("create_rule_fakeip", set())
+            assert wait_for_calls(fw, "create_rule_fakeip", 1)
+            threads = _calls_by_thread(fw)
+            assert threads["create_rule_fakeip"] == {"fakeip-refresh"}
+            assert fw.fakeip_ips == ["198.18.0.9"]
+        finally:
+            g._stop.set()
+            g._fakeip_wake.set()
+            g._fakeip_thread.join(timeout=5)
+            s.getaddrinfo = real
+
+    def test_hot_reload_rebuild_in_heal_thread(self, tmp_path):
+        """场景③热重载 v4/v6 段变化：tick 内只置标志；重建在 rule-heal
+        线程执行，重建后 CG-V6 强制 Enabled（fail-closed）。"""
+        import json as _json
+        import os as _os
+        cfg_path = tmp_path / "config.json"
+        data = {
+            "blocked_cidrs_v4": ["203.0.113.0/24"],
+            "blocked_cidrs_v6": ["2001:db8::/48"],
+            "rule_name_v4": "CG-Global", "rule_name_v6": "CG-V6",
+            "whitelist": ["203.0.113.10"],
+            "echo_endpoints": ["https://echo.test/ip"],
+            "fakeip_range": "198.18.0.0/15",
+            "mihomo_process": "m.exe", "tun_adapter_keywords": ["mihomo"],
+            "fast_tick_sec": 1, "slow_tick_sec": 5,
+            "pass_confirm_count": 3, "fail_unreachable_threshold": 5,
+            "doh_check_interval_min": 60, "ripe_check_interval_hours": 24,
+            "override_minutes": 30, "claude_domains": ["claude.ai"],
+            "asn": "AS399358", "log_dir": str(tmp_path / "logs"),
+            "log_retention_days": 30,
+        }
+        cfg_path.write_text(_json.dumps(data), encoding="utf-8")
+        g, fw, *_ , _ = make_guardian(tmp_path, config_path=cfg_path)
+        data["blocked_cidrs_v4"] = ["203.0.113.0/24", "198.51.100.0/24"]
+        data["blocked_cidrs_v6"] = ["2001:db8::/48", "2607:6bc0::/48"]
+        cfg_path.write_text(_json.dumps(data), encoding="utf-8")
+        st = _os.stat(cfg_path)
+        _os.utime(cfg_path, (st.st_atime, st.st_mtime + 10))
+        g.tick()
+        # tick 内零 PS：只置标志
+        assert g._pending_rebuild == (True, True)
+        threads = _calls_by_thread(fw)
+        assert "guardian-main" not in threads.get("create_rule", set())
+        assert "guardian-main" not in threads.get("create_rule_v6", set())
+        assert "guardian-main" not in threads.get("ensure_enabled_v6", set())
+        # heal 线程消费 → 重建发生且 v6 强制 Enabled
+        g._self_heal_rules()
+        threads = _calls_by_thread(fw)
+        assert "create_rule" in threads
+        assert "create_rule_v6" in threads
+        assert "ensure_enabled_v6" in threads
+        assert "guardian-main" not in threads["create_rule"]
+        assert "guardian-main" not in threads["create_rule_v6"]
+        assert "guardian-main" not in threads["ensure_enabled_v6"]
+
 
 # ----------------------------------------------------------------- 自检
 
@@ -899,19 +1081,70 @@ class TestSelfcheck:
                                 in_fakeip_range=True))
         # 检查⑤也必须打桩：真实探针依赖网络/akahelp 可用性（不可达时
         # 单元测试应仍稳定——selfcheck 语义见 dns_clean 三态）。
-        monkeypatch.setattr(
-            guardian.dnscheck, "check_dns_egress",
-            lambda domain, wl: (guardian.policy.CLEAN,
-                                guardian.dnscheck.DnsEgressResult(
-                                    ok=True, egress_ip="203.0.113.10",
-                                    records=("ns", "203.0.113.10"))))
-        cfg = make_config()
+        # P2-1：签名含第三参 countries（与运行时 _probe_dns_egress 一致），
+        # 并记录实参验证 selfcheck 传出 config 的国家列表。
+        seen_args: dict = {}
+
+        def _fake_dns_egress(domain, wl, countries=None):
+            seen_args.update(domain=domain, wl=list(wl), countries=list(countries or []))
+            return (guardian.policy.CLEAN,
+                    guardian.dnscheck.DnsEgressResult(
+                        ok=True, egress_ip="203.0.113.10",
+                        records=("ns", "203.0.113.10")))
+
+        monkeypatch.setattr(guardian.dnscheck, "check_dns_egress",
+                            _fake_dns_egress)
+        # P2-14：③' collect_fakeips（真实 getaddrinfo）与防火墙状态读
+        # （真实 PS 子进程）补打桩——CI/断网机器语义下也可运行。
+        monkeypatch.setattr(guardian, "collect_fakeips",
+                            lambda cfg, log=None: ("198.18.0.1",))
+        monkeypatch.setattr(guardian.fw_mod, "get_status_fakeip",
+                            lambda cfg: "ENABLED")
+        cfg = make_config(dns_egress_countries=["US"])
         rc = guardian.selfcheck(cfg)
         out = capsys.readouterr().out
         # 主结论在第一行（防火墙状态），技术细节在分隔线之后
         assert out.splitlines()[0].startswith(("🛡", "✅"))
         assert "技术细节" in out
         assert "①" in out and "②" in out and "③" in out and "④" in out
+        assert rc == 0
+        # P2-1：selfcheck 必须传出 config.dns_egress_countries 与
+        # dns_whitelist（不再 or 链回退）
+        assert seen_args["countries"] == ["US"]
+        assert seen_args["wl"] == list(cfg.dns_whitelist)
+
+    def test_selfcheck_fully_mocked_no_subprocess(self, tmp_path, capsys, monkeypatch):
+        """P2-14：TestSelfcheck 全 mock 后零真实子进程——断网/无同名规则
+        机器语义下也可运行（subprocess.run 被调用即失败）。"""
+        monkeypatch.setattr(guardian.netprobe, "check_mihomo_process",
+                            lambda name: True)
+        monkeypatch.setattr(guardian.netprobe, "check_tun_adapter",
+                            lambda kw, rng: (True, "Mihomo"))
+        monkeypatch.setattr(guardian.netprobe, "probe_echo_endpoints",
+                            lambda eps: guardian.netprobe.EchoResult(
+                                ok=True, ip="203.0.113.10", endpoint=eps[0]))
+        monkeypatch.setattr(guardian.dnscheck, "check_fakeip",
+                            lambda host, rng: guardian.dnscheck.FakeIpResult(
+                                ok=True, resolved_ips=("198.18.0.1",),
+                                in_fakeip_range=True))
+        monkeypatch.setattr(
+            guardian.dnscheck, "check_dns_egress",
+            lambda domain, wl, countries=None: (
+                guardian.policy.CLEAN,
+                guardian.dnscheck.DnsEgressResult(
+                    ok=True, egress_ip="203.0.113.10",
+                    records=("ns", "203.0.113.10"))))
+        monkeypatch.setattr(guardian, "collect_fakeips",
+                            lambda cfg, log=None: ("198.18.0.1",))
+        monkeypatch.setattr(guardian.fw_mod, "get_status_fakeip",
+                            lambda cfg: "ENABLED")
+
+        import subprocess as _sp
+        monkeypatch.setattr(
+            _sp, "run",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("selfcheck 不应发起真实子进程")))
+        rc = guardian.selfcheck(make_config())
         assert rc == 0
 
     def test_guardian_module_no_pystray(self):
@@ -1012,6 +1245,7 @@ class TestCidrHotReloadRebuild:
         path.write_text(json.dumps(data), encoding="utf-8")
 
     def test_v4_cidr_change_rebuilds_rule(self, tmp_path):
+        """P2-5：tick 内零 PS——只置 _pending_rebuild，重建由 heal 线程执行。"""
         cfg_path = tmp_path / "config.json"
         self._write_cfg(cfg_path, tmp_path)
         g, fw, *_ , _ = make_guardian(tmp_path, config_path=cfg_path)
@@ -1022,11 +1256,19 @@ class TestCidrHotReloadRebuild:
         st = os.stat(cfg_path)
         os.utime(cfg_path, (st.st_atime, st.st_mtime + 10))
         g.tick()
+        # tick 内：只置标志，不发 create_rule
+        assert "create_rule" not in fw.calls
+        assert g._pending_rebuild == (True, False)
+        # heal 线程消费标志 → 重建发生（guardian-main 线程外）
+        g._self_heal_rules()
         assert "create_rule" in fw.calls
         # BLOCKED 期望 Enabled：重建后不应 disable
         assert "disable" not in fw.calls
+        # 标志已消费，不重复重建
+        assert g._pending_rebuild is None
 
     def test_v6_cidr_change_rebuilds_rule(self, tmp_path):
+        """P2-5：v6 段变化同样走 heal 线程重建，重建后 CG-V6 强制 Enabled。"""
         cfg_path = tmp_path / "config.json"
         self._write_cfg(cfg_path, tmp_path)
         g, fw, *_ , _ = make_guardian(tmp_path, config_path=cfg_path)
@@ -1037,7 +1279,11 @@ class TestCidrHotReloadRebuild:
         st = os.stat(cfg_path)
         os.utime(cfg_path, (st.st_atime, st.st_mtime + 10))
         g.tick()
+        assert "create_rule_v6" not in fw.calls       # tick 内零 PS
+        assert g._pending_rebuild == (False, True)
+        g._self_heal_rules()
         assert "create_rule_v6" in fw.calls
+        assert "ensure_enabled_v6" in fw.calls        # 重建后 v6 强制 Enabled
 
     def test_no_cidr_change_no_rebuild(self, tmp_path):
         cfg_path = tmp_path / "config.json"
@@ -1192,7 +1438,8 @@ class TestFakeipLifecycle:
         assert "set_blocking_off" in fw.calls  # 原子切换含 FakeIP disable
 
     def test_fakeip_set_change_rebuilds_rule(self, tmp_path):
-        """慢路径每轮重解析；集合变化 → create_rule_fakeip 重建。"""
+        """慢路径每轮重解析；集合变化 → 登记 pending 并唤醒 refresh 线程
+        重建（P2-5：tick 内零 PS，重建最终发生在 fakeip-refresh 线程）。"""
         import socket as s
         g, fw, *_ , _ = make_guardian(tmp_path)
         g._gstate = sm.GateState(state=sm.BLOCKED)
@@ -1204,20 +1451,30 @@ class TestFakeipLifecycle:
 
         real = s.getaddrinfo
         s.getaddrinfo = ga
+        g._fakeip_thread = threading.Thread(
+            target=g._fakeip_refresh_loop, name="fakeip-refresh", daemon=True)
+        g._fakeip_thread.start()
         try:
             g._tick_count = 4
             g.tick()
+            assert wait_for_calls(fw, "create_rule_fakeip", 1)
             assert fw.fakeip_ips == ["198.18.0.1"]
             current["ips"] = ["198.18.0.2", "198.18.0.1"]
             g._tick_count = 9
             g.tick()
+            assert wait_for_calls(fw, "create_rule_fakeip", 2)
             assert fw.fakeip_ips == ["198.18.0.2", "198.18.0.1"]
             before = fw.calls.count("create_rule_fakeip")
             g._tick_count = 14
             g.tick()
+            import time as _t
+            _t.sleep(0.1)   # 无变化不应再重建
             assert fw.calls.count("create_rule_fakeip") == before
         finally:
             s.getaddrinfo = real
+            g._stop.set()
+            g._fakeip_wake.set()
+            g._fakeip_thread.join(timeout=5)
 
     def test_empty_fakeip_set_keeps_rule(self, tmp_path):
         """解析失败（空集）→ 规则保持现状，不被清空。"""
@@ -1256,7 +1513,7 @@ class TestFakeipLifecycle:
             s.getaddrinfo = real
 
     def test_fakeip_rebuild_in_allowed_state_restores_disabled(self, tmp_path):
-        """放行态下集合变化重建后须恢复 Disabled。"""
+        """放行态下集合变化重建后须恢复 Disabled（重建动作经 refresh 线程）。"""
         import socket as s
         g, fw, *_ , _ = make_guardian(tmp_path)
         g._gstate = sm.GateState(state=sm.ALLOWED, on_override=False)
@@ -1266,7 +1523,9 @@ class TestFakeipLifecycle:
         real = s.getaddrinfo
         s.getaddrinfo = lambda h, *a, **k: [(2, 1, 6, "", ("198.18.0.9", 0))]
         try:
-            g._refresh_fakeip_rule()
+            g._refresh_fakeip_rule()          # 只登记 pending + 唤醒
+            assert g._fakeip_pending == ("198.18.0.9",)
+            g._rebuild_fakeip_rule(g._fakeip_pending)  # 线程内执行的重建
             assert fw.fakeip_ips == ["198.18.0.9"]
             assert fw.fakeip_enabled is False
         finally:
@@ -1326,14 +1585,23 @@ class TestFakeipLifecycle:
 
         real = s.getaddrinfo
         s.getaddrinfo = ga
+        g._fakeip_thread = threading.Thread(
+            target=g._fakeip_refresh_loop, name="fakeip-refresh", daemon=True)
+        g._fakeip_thread.start()
         try:
             g._config_mtime = None
-            g._maybe_reload_config()
+            g._maybe_reload_config()          # tick 内：只置 None + 唤醒
+            assert g.config.claude_domains == ["claude.ai", "api.anthropic.com"]
+            assert "create_rule_fakeip" not in fw.calls   # tick 内零 PS
+            assert wait_for_calls(fw, "create_rule_fakeip", 1)
+            assert fw.fakeip_ips == ["198.18.0.1"]
         finally:
+            # 先停线程再还原 getaddrinfo：refresh 线程若在还原后重采集，
+            # 会拿到本机真实 mihomo fake-ip（非确定值）污染断言
+            g._stop.set()
+            g._fakeip_wake.set()
+            g._fakeip_thread.join(timeout=5)
             s.getaddrinfo = real
-        assert g.config.claude_domains == ["claude.ai", "api.anthropic.com"]
-        assert calls["n"] >= 2
-        assert fw.fakeip_ips == ["198.18.0.1"]
 
 
 # ----------------------------------------------------------------- fake-ip 迁移刷新
