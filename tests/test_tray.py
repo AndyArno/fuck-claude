@@ -189,3 +189,74 @@ class TestApplySurvivesBadEvent:
             t._event_loop()
         assert t._last_event is good  # 坏事件没杀死循环，好事件照常应用
         assert any("托盘状态应用失败" in r.message for r in caplog.records)
+
+
+class TestMenuLabelCallable:
+    """P3-6：临时放行菜单标签以 callable 传给 MenuItem，随 _last_event
+    热更新（曾求值一次固化，热重载 override_minutes 后文案不同步）。"""
+
+    def test_label_follows_last_event(self):
+        t = Tray()
+        t._last_event = _event()
+        assert t._override_label() == "临时放行 30 分钟"
+        t._last_event.override_minutes = 5
+        assert t._override_label() == "临时放行 5 分钟"
+
+    def test_menu_item_text_evaluates_live(self):
+        """MenuItem.text 求值走 callable：同一菜单项对象在不同
+        _last_event 下返回不同文案。"""
+        from pystray._base import MenuItem
+        t = Tray()
+        t._last_event = _event()
+        item = MenuItem(t._override_label, lambda icon, item: None)
+        assert item.text == "临时放行 30 分钟"
+        t._last_event.override_minutes = 5
+        assert item.text == "临时放行 5 分钟"
+
+
+class TestExitCommandDedup:
+    """P3-19：EXIT 命令入队去重——队列已有未消费 exit 时不再投递，
+    block_all 只执行一次。"""
+
+    def test_duplicate_exit_dropped(self):
+        t = Tray()
+        cb = t._menu_cb(Command.EXIT)
+        cb(None, None)
+        cb(None, None)
+        cb(None, None)
+        assert list(t.commands.queue) == [Command.EXIT]
+
+    def test_exit_after_consumed_requeues(self):
+        """消费后的 exit 允许再次投递（不是永久去重）。"""
+        t = Tray()
+        t._menu_cb(Command.EXIT)(None, None)
+        assert t.commands.get_nowait() is Command.EXIT
+        t._menu_cb(Command.EXIT)(None, None)
+        assert t.commands.get_nowait() is Command.EXIT
+
+    def test_other_commands_not_deduped(self):
+        t = Tray()
+        cb = t._menu_cb(Command.TOGGLE_PAUSE)
+        cb(None, None)
+        cb(None, None)
+        assert list(t.commands.queue) == [Command.TOGGLE_PAUSE,
+                                          Command.TOGGLE_PAUSE]
+
+
+class TestOnCommandWake:
+    """P3-20：_menu_cb → commands 队列投递 + _on_command 唤醒回调被调
+    （该正向分支此前零覆盖）。"""
+
+    def test_menu_cb_enqueues_and_wakes(self):
+        t = Tray()
+        woke = []
+        t._on_command = lambda: woke.append(1)
+        t._menu_cb(Command.OVERRIDE_30MIN)(None, None)
+        assert t.commands.get_nowait() is Command.OVERRIDE_30MIN
+        assert woke == [1]
+
+    def test_menu_cb_without_wake_callback_no_throw(self):
+        """guardian 未 start（未注册回调）时投递照常、不抛。"""
+        t = Tray()
+        t._menu_cb(Command.EXIT)(None, None)
+        assert t.commands.get_nowait() is Command.EXIT

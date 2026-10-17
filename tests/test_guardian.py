@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import struct
 import threading
 
 import pytest
@@ -24,16 +25,14 @@ from core.config import Config
 class FakeFirewall:
     """记录调用的防火墙替身。初始状态：CG-Global Enabled（阻断态）。
 
-    status_mode 控制真实 guardian._self_heal_rules 的适配面：
-    - "tristate"：get_status 返回 'ENABLED'/'DISABLED'/'MISSING'（C2/C3 修复后的新语义）
-    - "bool"：返回 True/False（旧语义，guardian 需兼容）
-    - missing=True：模拟规则被第三方删除（返回 MISSING）
+    get_status/get_status_fakeip 恒返回三态字符串（'ENABLED'/'DISABLED'/
+    'MISSING'，与生产一致；P3-11 删除旧 bool 兼容面）。
+    missing=True：模拟规则被第三方删除（返回 MISSING）。
     """
 
-    def __init__(self, global_enabled: bool = True, status_mode: str = "tristate",
+    def __init__(self, global_enabled: bool = True,
                  missing: bool = False, fail_methods: set | None = None) -> None:
         self.global_enabled = global_enabled
-        self.status_mode = status_mode
         self.missing = missing
         self.fakeip_enabled: bool | None = None  # None = 规则不存在
         self.fakeip_ips: list[str] = []
@@ -93,9 +92,7 @@ class FakeFirewall:
         self.threaded_calls.append(("get_status", threading.current_thread().name))
         if self.missing:
             return "MISSING"
-        if self.status_mode == "tristate":
-            return "ENABLED" if self.global_enabled else "DISABLED"
-        return self.global_enabled
+        return "ENABLED" if self.global_enabled else "DISABLED"
 
     def ensure_exists(self, config) -> None:
         self.calls.append("ensure_exists")
@@ -703,18 +700,6 @@ class TestSelfHeal:
         g._heal_wake.set()
         g._heal_thread.join(timeout=5)
 
-    def test_bool_status_compat(self, tmp_path):
-        """旧 bool 语义（True/False）仍被兼容。"""
-        g, fw, *_ , _ = make_guardian(tmp_path)
-        fw.status_mode = "bool"
-        fw.global_enabled = False
-        start_heal_thread(g)
-        assert wait_for_calls(fw, "enable", 1)
-        assert fw.global_enabled is True
-        g._stop.set()
-        g._heal_wake.set()
-        g._heal_thread.join(timeout=5)
-
     def test_v6_ensured_per_heal_round(self, tmp_path):
         """heal 线程每轮都 ensure CG-V6（跑两轮验证）。"""
         g, fw, *_ , _ = make_guardian(tmp_path)
@@ -1146,6 +1131,92 @@ class TestSelfcheck:
                 AssertionError("selfcheck 不应发起真实子进程")))
         rc = guardian.selfcheck(make_config())
         assert rc == 0
+
+    def test_selfcheck_dns_probe_exception_fail_closed(self, tmp_path, capsys, monkeypatch):
+        """P3-12a：检查⑤底层解析异常（如 struct.error）→ selfcheck 正常
+        输出"探测异常"且退出码非 0（fail-closed，不自判"已放行"）。"""
+        monkeypatch.setattr(guardian.netprobe, "check_mihomo_process",
+                            lambda name: True)
+        monkeypatch.setattr(guardian.netprobe, "check_tun_adapter",
+                            lambda kw, rng: (True, "Mihomo"))
+        monkeypatch.setattr(guardian.netprobe, "probe_echo_endpoints",
+                            lambda eps: guardian.netprobe.EchoResult(
+                                ok=True, ip="203.0.113.10", endpoint=eps[0]))
+        monkeypatch.setattr(guardian.dnscheck, "check_fakeip",
+                            lambda host, rng: guardian.dnscheck.FakeIpResult(
+                                ok=True, resolved_ips=("198.18.0.1",),
+                                in_fakeip_range=True))
+
+        def _boom(domain, wl, countries=None):
+            raise struct.error("remote-socket buffer overflow")
+
+        monkeypatch.setattr(guardian.dnscheck, "check_dns_egress", _boom)
+        monkeypatch.setattr(guardian, "collect_fakeips",
+                            lambda cfg, log=None: ("198.18.0.1",))
+        monkeypatch.setattr(guardian.fw_mod, "get_status_fakeip",
+                            lambda cfg: "ENABLED")
+        rc = guardian.selfcheck(make_config())
+        out = capsys.readouterr().out
+        assert rc != 0  # fail-closed：探测异常按不可达处理，不放行
+        assert "⑤" in out and "探测异常" not in out  # 主结论区不误判泄漏
+        # DNS 三态为"未探测"而非"未通过"（不可达 ≠ 泄漏）
+        assert "未探测" in out
+
+    def test_selfcheck_intro_from_messages(self, tmp_path, capsys, monkeypatch):
+        """P3-18：selfcheck 分隔线前两条文案来自 messages.selfcheck_intro()
+        （monkeypatch 返回哨兵值可观测传播；两个消费分支各跑一遍）。"""
+        base_mocks = dict(
+            mihomo=lambda name: True,
+            tun=lambda kw, rng: (True, "Mihomo"),
+        )
+
+        def _mock_common():
+            monkeypatch.setattr(guardian.netprobe, "check_mihomo_process",
+                                base_mocks["mihomo"])
+            monkeypatch.setattr(guardian.netprobe, "check_tun_adapter",
+                                base_mocks["tun"])
+            monkeypatch.setattr(guardian.dnscheck, "check_fakeip",
+                                lambda host, rng: guardian.dnscheck.FakeIpResult(
+                                    ok=True, resolved_ips=("198.18.0.1",),
+                                    in_fakeip_range=True))
+            monkeypatch.setattr(guardian, "collect_fakeips",
+                                lambda cfg, log=None: ("198.18.0.1",))
+            monkeypatch.setattr(guardian.fw_mod, "get_status_fakeip",
+                                lambda cfg: "ENABLED")
+            monkeypatch.setattr(guardian.messages, "selfcheck_intro",
+                                lambda: ("[哨兵-未确认提示]", "[哨兵-只读说明]"))
+
+        # 分支一：echo/DNS 全净（unconfirmed=False？——echo 不可达时才
+        # unconfirmed，这里让 echo 不可达以走未确认分支）
+        _mock_common()
+        monkeypatch.setattr(guardian.netprobe, "probe_echo_endpoints",
+                            lambda eps: guardian.netprobe.EchoResult(
+                                ok=False, ip=None, endpoint=None, error="x"))
+        monkeypatch.setattr(guardian.dnscheck, "check_dns_egress",
+                            lambda domain, wl, countries=None: (
+                                guardian.policy.UNREACHABLE,
+                                guardian.dnscheck.DnsEgressResult(ok=False)))
+        guardian.selfcheck(make_config())
+        out = capsys.readouterr().out
+        assert "[哨兵-未确认提示]" in out   # unconfirmed 分支消费第一条
+        assert "[哨兵-只读说明]" in out     # 放行（未确认）分支消费第二条
+
+        # 分支二：全净 → status_line 主结论；只读说明仍消费第二条
+        _mock_common()
+        monkeypatch.setattr(guardian.netprobe, "probe_echo_endpoints",
+                            lambda eps: guardian.netprobe.EchoResult(
+                                ok=True, ip="203.0.113.10", endpoint=eps[0]))
+        monkeypatch.setattr(guardian.dnscheck, "check_dns_egress",
+                            lambda domain, wl, countries=None: (
+                                guardian.policy.CLEAN,
+                                guardian.dnscheck.DnsEgressResult(
+                                    ok=True, egress_ip="203.0.113.10",
+                                    records=("ns",))))
+        rc = guardian.selfcheck(make_config())
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "[哨兵-未确认提示]" not in out
+        assert "[哨兵-只读说明]" in out
 
     def test_guardian_module_no_pystray(self):
         import guardian as g_mod
@@ -1685,6 +1756,32 @@ class TestAuditCopyFixes:
         assert g.override_until is None
         audit = tmp_path / "logs" / "override-audit.log"
         assert "end pause" in audit.read_text(encoding="utf-8")
+
+    def test_override_start_toast_on_override_start_event(self, tmp_path):
+        """P3-5 正例：OVERRIDE_START 首次启动仍发"临时放行开始"。"""
+        toasts = []
+        g, fw, *_ , _ = make_guardian(
+            tmp_path, notify_fn=lambda t, b: toasts.append((t, b)))
+        g._apply_event(sm.OVERRIDE_START)
+        assert len(toasts) == 1
+        assert "临时放行" in toasts[0][1] and "分钟" in toasts[0][1]
+
+    def test_override_start_toast_skipped_on_check_pass_during_override(self, tmp_path):
+        """P3-5 回归：override 从 BLOCKED 启动后慢路径连续 CLEAN 触发
+        CHECK_PASS 迁移——NOTIFY_ALLOW 不再误判为"临时放行开始"重弹
+        toast_override_start，只发普通放行文案（或不弹）。"""
+        toasts = []
+        g, fw, *_ , _ = make_guardian(
+            tmp_path, notify_fn=lambda t, b: toasts.append((t, b)))
+        # override 启动（BLOCKED 态点 override）
+        g._apply_event(sm.OVERRIDE_START)
+        assert sum("临时放行" in b for _, b in toasts) == 1
+        # override 期间环境转净：CHECK_PASS 迁移（on_override 仍 True）
+        g._apply_event(sm.CHECK_PASS)
+        assert g._gstate.state == sm.ALLOWED
+        starts = [b for _, b in toasts if "临时放行" in b]
+        assert len(starts) == 1  # 不重弹
+        assert any("出口 IP 干净" in b for _, b in toasts)  # 普通放行文案
 
     def test_heal_expected_enabled_when_paused(self, tmp_path):
         """暂停期间 heal 线程期望恒为 Enabled（冻结阻断）。"""

@@ -10,26 +10,25 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class CheckOutcome:
-    """Single slow-tick evaluation result handed to the state machine.
+    """单轮慢路径判定结果（传给状态机/计数的纯数据）。
 
-    check_results: per-check booleans, all must be True for a PASS.
-      Keys: mihomo_alive, tun_present, fakeip_ok, echo (verdict string).
-    verdict: 'CLEAN' / 'DIRTY' / 'UNREACHABLE' for the echo probe.
-    dirty: True when any visible check failed outright (fast-path style).
+    verdict: echo/DNS 综合三分法结果 'CLEAN' / 'DIRTY' / 'UNREACHABLE'。
+      UNREACHABLE 中断放行确认窗、计入不可达升级计数（不等于看到脏）；
+      DIRTY 混入任一探针即视为脏，立即升级阻断。
+    dirty: 快路径等级的硬失败（本地检查 ①② 失败）→ 立即 BLOCK_NOW。
     """
     verdict: str = "CLEAN"
     dirty: bool = False
 
 
 class CheckCounter:
-    """Confirmation-window pass counter + consecutive-unreachable counter.
+    """确认窗计数器：放行通过连击 + 连续不可达升级计数。
 
-    - pass streak must reach pass_confirm_count consecutively; any
-      interruption (FAIL/DIRTY/UNREACHABLE reset per G-3 semantics:
-      only a hard DIRTY/FAIL blocks immediately, UNREACHABLE preserves
-      the pass streak? No — spec says interruption resets) resets to 0.
-    - unreachable streak: fail_unreachable_threshold consecutive
-      UNREACHABLE verdicts escalate to block.
+    - pass_streak：连续 CLEAN 次数，达到 pass_confirm_count → PASS_CONFIRMED。
+      DIRTY/硬失败 reset 且立即 BLOCK_NOW；UNREACHABLE 中断确认窗
+      （pass_streak 清零）并累计不可达。
+    - unreachable_streak：连续 UNREACHABLE 次数，达到
+      fail_unreachable_threshold → BLOCK_NOW（fail-closed：探不到 ≠ 环境正常）。
     """
 
     def __init__(self, pass_confirm_count: int, fail_unreachable_threshold: int) -> None:

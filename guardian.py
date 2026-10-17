@@ -471,8 +471,12 @@ class Guardian:
         old = self._gstate
         tr = sm.transition(self._gstate, event)
         self._gstate = tr.new_state
+        # P3-5：override 启动动作（OVERRIDE_START）的 NOTIFY_ALLOW 才用
+        # "临时放行开始"文案；override 期间环境转净的 CHECK_PASS 虽也带
+        # NOTIFY_ALLOW 且 on_override 仍为 True，但要走普通放行文案。
+        from_override_start = (event == sm.OVERRIDE_START)
         if tr.actions:
-            self._execute(tr.actions)
+            self._execute(tr.actions, from_override_start=from_override_start)
         self.log.info("[耗时] 事件 %s 迁移+动作 %.0fms",
                       event, (_time.monotonic() - _t0) * 1000)
         if old != self._gstate or tr.actions:
@@ -490,7 +494,8 @@ class Guardian:
             # 慢路径 5s 间隙——迁移后首轮必须立即把新集合写进规则。
             self._fakeip_wake.set()
 
-    def _execute(self, actions: list[dict]) -> None:
+    def _execute(self, actions: list[dict],
+                 from_override_start: bool = False) -> None:
         for a in actions:
             act = a.get("action")
             if act == sm.ENABLE_FIREWALL:
@@ -502,21 +507,28 @@ class Guardian:
             elif act == sm.DISABLE_FIREWALL:
                 self._fw_tolerant("set_blocking", False)
             elif act in (sm.NOTIFY_BLOCK, sm.NOTIFY_ALLOW, sm.NOTIFY_ALERT):
-                title, body = self._toast_text(act, a.get("message"))
+                title, body = self._toast_text(
+                    act, a.get("message"),
+                    _from_override_start=from_override_start)
                 self._notify(title, body)
             else:  # pragma: no cover - 状态机之外的指令
                 self.log.warning("未知 action: %r", a)
 
-    def _toast_text(self, act: str, message: str | None = None) -> tuple[str, str]:
+    def _toast_text(self, act: str, message: str | None = None,
+                    _from_override_start: bool = False) -> tuple[str, str]:
         """状态切换 Toast 文案，统一从 core.messages 取（用户可见面）。
 
         message 为状态机 action 携带的中性标记（如"临时放行结束"）：
         计划内的 override 到期走专属文案，避免把"复检恢复"误报成
-        新发生的风险阻断（曾叠加出口误报"不在白名单"）。"""
+        新发生的风险阻断（曾叠加出口误报"不在白名单"）。
+
+        _from_override_start（P3-5）：本次 NOTIFY_ALLOW 是 override 启动
+        （OVERRIDE_START 动作，state 尚未离开 BLOCKED 也算）——由调用方
+        依据动作序列传入。override 期间环境转净触发 CHECK_PASS 时
+        on_override 仍为 True，但那不是"临时放行开始"，必须回普通放行
+        文案，否则重复弹"临时放行开始"误导（实测复现）。"""
         if act == sm.NOTIFY_ALLOW:
-            # 临时放行开始的放行动作 ≠ 出口干净：override 语境用专属文案
-            # （曾误报"出口 IP 干净"误导用户，实测发现）。
-            if self._gstate.on_override:
+            if self._gstate.on_override and _from_override_start:
                 return messages.toast_override_start(self.config.override_minutes)
             return messages.toast_allow()
         if act == sm.NOTIFY_ALERT:
@@ -696,9 +708,9 @@ class Guardian:
         except Exception as exc:
             self.log.warning("读取 CG-Global 状态失败（跳过本轮自愈）：%s", exc)
             return
-        # 兼容两种语义：旧 bool（True/False）与新三态字符串
-        # （'ENABLED'/'DISABLED'/'MISSING'）。MISSING → 重建。
-        actual_str = str(actual).upper() if isinstance(actual, str) else None
+        # 生产 fw.get_status 恒返回三态字符串（'ENABLED'/'DISABLED'/'MISSING'）。
+        # MISSING → 重建。
+        actual_str = str(actual).upper()
         if actual_str == "MISSING":
             self.log.warning("CG-Global 规则缺失（可能被第三方删除），重建中")
             if self._fw_tolerant("ensure_exists"):
@@ -708,7 +720,7 @@ class Guardian:
                 if not expected_enabled and not self._stop.is_set():
                     self._fw_tolerant("disable")
             return
-        actual_enabled = actual_str == "ENABLED" if actual_str else bool(actual)
+        actual_enabled = actual_str == "ENABLED"
         if actual_enabled != expected_enabled:
             self.log.warning(
                 "CG-Global 实际状态 %s 与期望 %s 不符（可能被第三方重置），纠正中",
@@ -751,9 +763,8 @@ class Guardian:
                     if not expected_enabled and not self._stop.is_set():
                         self._fw_tolerant("disable_fakeip")
             return
-        # 与 CG-Global 相同的兼容语义：三态字符串优先，否则按 bool（真值=Enabled）
-        actual_enabled = (status_str == "ENABLED" if status_str in
-                          ("ENABLED", "DISABLED") else bool(status))
+        # 生产 get_status_fakeip 恒返回三态字符串；DISABLED/其他按非 Enabled。
+        actual_enabled = status_str == "ENABLED"
         if actual_enabled != expected_enabled:
             self.log.warning(
                 "CG-FakeIP 实际状态 %s 与期望 %s 不符，纠正中",
@@ -1153,11 +1164,17 @@ def selfcheck(config: Config, logger: logging.Logger | None = None) -> int:
     fast_ok = mihomo and tun_ok
 
     # ⑤ DNS 出口探针：递归出口不在白名单 → 泄漏，与出口脏同权
-    # load 已保证 dns_whitelist 有值（键缺失回退 whitelist），不再 or 链
-    dns_verdict, dns_probe = dnscheck.check_dns_egress(
-        config.dns_probe_domain,
-        list(config.dns_whitelist),
-        list(config.dns_egress_countries))
+    # load 已保证 dns_whitelist 有值（键缺失回退 whitelist），不再 or 链。
+    # P3-12a：底层解析异常（如 struct.error）在守护路径有 UNREACHABLE 兜底，
+    # selfcheck 同样不得 traceback——异常按"探测不可达"展示，不下"已放行"。
+    try:
+        dns_verdict, dns_probe = dnscheck.check_dns_egress(
+            config.dns_probe_domain,
+            list(config.dns_whitelist),
+            list(config.dns_egress_countries))
+    except Exception as exc:
+        dns_verdict, dns_probe = policy.UNREACHABLE, dnscheck.DnsEgressResult(
+            ok=False, error=str(exc))
     dns_leak_ip = dns_probe.egress_ip if dns_probe.ok else None
     # 三态：True=干净 False=泄漏 None=探测不可达（不可达≠泄漏，
     # 曾映射成 False 被显示为"未通过"）。
@@ -1189,14 +1206,14 @@ def selfcheck(config: Config, logger: logging.Logger | None = None) -> int:
     # 自检是单轮快照，不等于确认窗口已通过（托盘侧放行需 3 连 CLEAN）。
     unconfirmed = (not should_block
                    and (echo_ok is None or dns_clean is None))
+    intro_unconfirmed, intro_readonly = messages.selfcheck_intro()
     if unconfirmed:
-        print("⏳ 当前检查未见异常，但探测未全部成功，"
-              "未能确认是否可以放行（以托盘实际状态为准）")
+        print(intro_unconfirmed)
     else:
         print(messages.status_line(status))
     print(messages.reason_line(status))
     if not should_block:
-        print("（自检为只读探测，不改变防火墙当前状态）")
+        print(intro_readonly)
 
     # ---- 技术细节（排障用）----
     print()
@@ -1241,4 +1258,6 @@ def selfcheck(config: Config, logger: logging.Logger | None = None) -> int:
     print(f"五项检查: {readable}")
     # 退出码：应阻断（含 fake-ip 失效等 local 检查失败、出口/DNS 脏）
     # 才非零（曾只看 fast_ok，掩盖 fake-ip 失效与真实泄漏）。
-    return 0 if not should_block else 1
+    # P3-12a fail-closed：探测未全部成功（unconfirmed）同样非零——
+    # 单轮快照没确认通过就不能给调用方"一切正常"的信号。
+    return 0 if (not should_block and not unconfirmed) else 1

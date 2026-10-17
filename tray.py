@@ -221,6 +221,14 @@ class Tray:
 
     def _menu_cb(self, cmd: Command):
         def callback(icon, item):
+            # P3-19：EXIT 语义重（block_all 全量 PS，实测 ~3-4s）。双击/
+            # 系统卡顿会让回调连发，同毫秒两条"命令开始 exit"各付一次
+            # 全量 PS。队列里已有未消费的 exit 就不再投（drain 时第一条
+            # 即触发退出，冗余条目没有消费机会）。
+            if cmd is Command.EXIT:
+                with self.commands.mutex:
+                    if any(c is Command.EXIT for c in list(self.commands.queue)):
+                        return
             self.commands.put(cmd)  # 只投递，不执行业务
             # 立即唤醒 guardian 主循环：命令毫秒级被处理，不等下轮 tick
             if self._on_command is not None:
@@ -234,9 +242,11 @@ class Tray:
     def _on_override(self) -> bool:
         return bool(self._last_event and self._last_event.override_active)
 
-    def _override_label(self) -> str:
+    def _override_label(self, _item=None) -> str:
         """临时放行菜单文案：分钟数取 guardian 送达的配置值（曾硬编码
-        "30 分钟"，用户改 override_minutes 后菜单与实际时长不符）。"""
+        "30 分钟"，用户改 override_minutes 后菜单与实际时长不符）。
+        P3-6：作为 callable 传给 MenuItem.text（pystray 以 (item) 求值，
+        兼容直接调用），打开菜单时实时取 _last_event，不固化。"""
         minutes = 30
         if self._last_event is not None:
             minutes = self._last_event.override_minutes
@@ -250,7 +260,10 @@ class Tray:
                 "状态详情", self._show_details, default=True
             ),
             pystray.MenuItem(
-                self._override_label(),
+                # P3-6：传 callable（pystray 打开菜单时求值），热重载改
+                # override_minutes 后菜单文案跟随 _last_event 更新；
+                # 求值一次固化字符串则永不刷新（实测回归）。
+                self._override_label,
                 self._menu_cb(Command.OVERRIDE_30MIN),
                 # 已在临时放行中 → 置灰防重复点击
                 enabled=lambda item: not self._on_override(),
