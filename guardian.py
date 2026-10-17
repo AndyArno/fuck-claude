@@ -548,16 +548,25 @@ class Guardian:
     # ------------------------------------------------------------------ 防火墙容错
 
     def _fw_tolerant(self, method: str, *args, retries: int = 3,
-                     delay: float = 0.5, **kwargs) -> bool:
+                     delay: float = 0.5, final: bool = False,
+                     **kwargs) -> bool:
         """防火墙调用包裹重试/容错：PS 冷启动可达 13s（> firewall.py 10s 超时），
         失败重试；永不向上抛（主循环必须继续，fail-closed 下次自愈再纠正）。
         额外位置/关键字参数透传目标方法（如 create_rule_fakeip 的 ips）。
         单次调用整体持 _fw_lock：与 heal 线程的调用按次互斥，规则读写不交错
         （重试等待与子进程执行期间不持锁，锁粒度=一次 PS 调用）。
         每次调用计时入日志（排查命令延迟用：单次 PS 实测 0.75-1.5s，
-        命令路径串行多次即秒级延迟的来源）。"""
+        命令路径串行多次即秒级延迟的来源）。
+
+        final=True：退出语义要求的最后一次写入（exit 的 block_all），
+        跳过 stop 闸门——exit 分支先 _stop.set() 再写入（P1-2 双闸门），
+        不豁免则这里会立即放弃写、规则留在放行态杀进程。
+        其余写入见 stop 即放弃：防止 heal/命令在退出中途按旧期望反向纠正。"""
         import time as _time
         for attempt in range(1, retries + 1):
+            if self._stop.is_set() and not final:
+                self.log.info("退出中，放弃防火墙写入 %s", method)
+                return False  # P1-2 闸门：stop 后不再做非终结性写入
             with self._fw_lock:
                 _t0 = _time.monotonic()
                 try:
@@ -658,8 +667,10 @@ class Guardian:
         if actual_str == "MISSING":
             self.log.warning("CG-Global 规则缺失（可能被第三方删除），重建中")
             if self._fw_tolerant("ensure_exists"):
-                # 重建后按期望状态恢复（create_rule 默认 Enabled）
-                if not expected_enabled:
+                # 重建后按期望状态恢复（create_rule 默认 Enabled）。
+                # P1-2 纵深：重建成功后 stop 若已置位（退出中），不得再
+                # 按旧期望 disable 刚重建的规则。
+                if not expected_enabled and not self._stop.is_set():
                     self._fw_tolerant("disable")
             return
         actual_enabled = actual_str == "ENABLED" if actual_str else bool(actual)
@@ -669,7 +680,16 @@ class Guardian:
                 "Enabled" if actual_enabled else "Disabled",
                 "Enabled" if expected_enabled else "Disabled",
             )
+            # P1-2 纵深：disable 方向的纠正若发生在退出中（exit 已恢复
+            # 阻断），会把刚 Enable 的规则关掉——_fw_tolerant 闸门之外
+            # 再显式拦一道。
+            if self._stop.is_set() and not expected_enabled:
+                self.log.info("退出中，放弃 CG-Global disable 纠正")
+                return
             self._fw_tolerant("enable" if expected_enabled else "disable")
+        if self._stop.is_set() and not expected_enabled:
+            self.log.info("退出中，放弃 CG-FakeIP 自愈（期望放行）")
+            return
         self._heal_fakeip(expected_enabled)
         try:
             with self._fw_lock:
@@ -692,7 +712,8 @@ class Guardian:
                 self.log.warning("CG-FakeIP 规则缺失，用已知集合重建中")
                 if self._fw_tolerant("ensure_exists_fakeip",
                                      list(self._fakeip_rule_ips)):
-                    if not expected_enabled:
+                    # P1-2 纵深：重建后若退出中，不得按旧期望 disable。
+                    if not expected_enabled and not self._stop.is_set():
                         self._fw_tolerant("disable_fakeip")
             return
         # 与 CG-Global 相同的兼容语义：三态字符串优先，否则按 bool（真值=Enabled）
@@ -704,6 +725,10 @@ class Guardian:
                 "Enabled" if actual_enabled else "Disabled",
                 "Enabled" if expected_enabled else "Disabled",
             )
+            # P1-2 纵深：退出中不做 disable 方向纠正（exit 已恢复阻断）。
+            if self._stop.is_set() and not expected_enabled:
+                self.log.info("退出中，放弃 CG-FakeIP disable 纠正")
+                return
             self._fw_tolerant(
                 "enable_fakeip" if expected_enabled else "disable_fakeip")
 
@@ -793,11 +818,17 @@ class Guardian:
             # 单 PS 进程完成"缺失重建+启用+复查"两条规则（block_all）：
             # 原 4 次串行 PS 实测 ~15.6s（[耗时] 日志），现 ~3-4s。
             # 重建语义保留复审 H4 修复：规则被删时仅 enable 会假成功。
+            #
+            # P1-2 双闸门之一：先 _stop.set() 再写——heal 线程见 stop 即
+            # 终止/放弃纠正，防止它按旧 gstate 期望把刚恢复的阻断重新
+            # disable；final=True 使 _fw_tolerant 跳过 stop 检查完成这
+            # 最后一次写入（否则 stop 已置位、写入被自己闸掉）。
             self.log.info("收到 EXIT 命令：恢复阻断后退出")
+            self._stop.set()
             self._fw_tolerant(
                 "block_all",
-                list(self._fakeip_rule_ips) if self._fakeip_rule_ips else None)
-            self._stop.set()
+                list(self._fakeip_rule_ips) if self._fakeip_rule_ips else None,
+                final=True)
             return False
         else:
             self.log.warning("未知命令：%r", cmd)

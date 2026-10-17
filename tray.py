@@ -12,6 +12,7 @@ import enum
 import os
 import queue
 import threading
+import logging
 from dataclasses import dataclass, field
 
 import pystray
@@ -27,6 +28,8 @@ from core.messages import (
     status_line,
     tooltip as tooltip_text,
 )
+
+log = logging.getLogger("claude-guard.tray")
 
 
 class State(enum.Enum):
@@ -188,7 +191,9 @@ class Tray:
             try:
                 self._apply(evt)
             except Exception:
-                pass  # UI 更新失败不影响守护
+                # UI 更新失败不杀托盘线程，但不能静默吞——P1-1 教训：
+                # tooltip() NameError 曾在此被吞，菜单/标题冻结无人知晓。
+                log.exception("托盘状态应用失败（UI 冻结防护，事件已丢弃）")
 
     def _apply(self, evt: StateEvent) -> None:
         # 先更新 _last_event 再重建菜单：菜单项的 visible/checked/enabled

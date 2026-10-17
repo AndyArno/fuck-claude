@@ -117,6 +117,7 @@ def tooltip(s: Status) -> str:
              ("DNS", s.dns_egress_ok)]
     parts = [f"{label}{'✓' if v is True else '✗' if v is False else '–'}"
              for label, v in pairs]
+    summary = " ".join(parts)
     if len(head) + len(summary) + 1 <= 120:
         return f"{head}\n{summary}"
     return head

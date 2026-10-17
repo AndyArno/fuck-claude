@@ -180,9 +180,22 @@ def set_blocking(config: Config, blocking: bool) -> None:
     一次），复查用数组 Get（同进程第二次 cmdlet 复用 CIM 会话）。实测
     （[耗时] 排查日志）：两次独立调用 ~7.7s（每进程付 ~2.5s NetSecurity
     加载税 ×2）→ 单进程数组 ~3.6-4.0s。注意：-PassThru 返回切换前快照
-    不能当复查依据（实测 Disable 后 .Enabled 仍 True）。disable 路径
-    规则不存在视为已放行（幂等）；enable 失败由自愈线程 ensure_exists
-    重建兜底。
+    不能当复查依据（实测 Disable 后 .Enabled 仍 True）。
+
+    动词不带 -ErrorAction Stop（P1-3）：数组中缺失的 DisplayName 只产生
+    非终止错误，cmdlet 继续处理其余名——CG-FakeIP 不存在（Clash 未运行/
+    采集为空）时整脚本仍成功，缺失判定交给复查层。带 Stop 时缺失名把
+    非终止错误升级为脚本失败，`_run_ps` 抛 FirewallError，disable 的
+    "规则不存在=已放行"幂等分支被前置短路永不可达。
+
+    复查按方向收紧：
+    - blocking=True：CG-Global 必须存在且 Enabled（states 首位，Enable
+      按数组顺序操作）；CG-FakeIP 缺失可接受（无 fake-ip 集合时本就
+      不存在，heal 线程 ensure_exists 重建兜底）。
+    - blocking=False：所有实际存在的规则均 False 即成功；states 为空
+      （两条都不存在）= 幂等成功。
+    动词对不存在规则 exit 0 假成功——不能只看 _run_ps 不抛，必须逐值
+    比对 states（AGENTS.md 已录坑）。
     """
     n1 = _ps_quote(config.rule_name_v4)
     n2 = _ps_quote(config.rule_name_fakeip)
@@ -190,23 +203,31 @@ def set_blocking(config: Config, blocking: bool) -> None:
     want = "True" if blocking else "False"
     script = (
         "Import-Module NetSecurity;"
-        f"{verb}-NetFirewallRule -DisplayName @({n1},{n2}) -ErrorAction Stop;"
+        f"{verb}-NetFirewallRule -DisplayName @({n1},{n2});"
         f"(Get-NetFirewallRule -DisplayName @({n1},{n2})"
         " -ErrorAction SilentlyContinue)"
         " | ForEach-Object { Write-Output ([string]$_.Enabled) }"
     )
     out = _run_ps(script)
     states = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
-    if len(states) < 2:
-        if not blocking:
-            return  # disable：规则不存在 = 已放行（幂等）
+    if not blocking:
+        # disable：所有实际存在的规则都已 False 即成功；
+        # states 为空 = 两条都不存在 = 幂等成功。
+        for s in states:
+            if s != want:
+                raise FirewallError(
+                    f"set_blocking(False) verification failed: {states!r}"
+                )
+        return
+    # enable：CG-Global（首位）必须存在且 Enabled；CG-FakeIP 缺失可接受。
+    if not states or states[0] != want:
         raise FirewallError(
-            f"set_blocking(True) rules missing: output={out!r}"
+            f"set_blocking(True) CG-Global not enabled: states={states!r}"
         )
-    for s in states:
+    for s in states[1:]:
         if s != want:
             raise FirewallError(
-                f"set_blocking({blocking}) verification failed: {states!r}"
+                f"set_blocking(True) verification failed: {states!r}"
             )
 
 def block_all(config: Config, fakeip_ips: list[str] | None = None) -> None:
@@ -337,12 +358,6 @@ def ensure_enabled_v6(config: Config) -> None:
         create_rule_v6(config)
     elif state == "DISABLED":
         _run_ps("Enable-NetFirewallRule -DisplayName " + name)
-
-
-def get_status_v6(config: Config) -> RuleStatus:
-    """返回 CG-V6 三态（ENABLED/DISABLED/MISSING）。供每轮校验使用。"""
-    out = _run_ps(_build_get_status_script(_ps_quote(config.rule_name_v6)))
-    return _parse_get_status_output(out)
 
 
 # ---------------------------------------------------------------- CG-FakeIP

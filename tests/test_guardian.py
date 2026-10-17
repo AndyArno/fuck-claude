@@ -15,6 +15,7 @@ import guardian
 from guardian import Guardian
 from core import policy
 from core import statemachine as sm
+from winplat.firewall import FirewallError
 from core.config import Config
 
 
@@ -30,13 +31,19 @@ class FakeFirewall:
     """
 
     def __init__(self, global_enabled: bool = True, status_mode: str = "tristate",
-                 missing: bool = False) -> None:
+                 missing: bool = False, fail_methods: set | None = None) -> None:
         self.global_enabled = global_enabled
         self.status_mode = status_mode
         self.missing = missing
         self.fakeip_enabled: bool | None = None  # None = 规则不存在
         self.fakeip_ips: list[str] = []
         self.calls: list[str] = []
+        # P1-4：可控持续失败注入（如 {"set_blocking"}）——模拟 PS 权限
+        # 拒绝/防火墙服务异常，验证失败路径（_fw_tolerant 耗尽/heal 重试）。
+        self.fail_methods: set = fail_methods or set()
+
+    def fail_on(self, method: str) -> bool:
+        return method in self.fail_methods
 
     def create_rule(self, config) -> None:
         self.calls.append("create_rule")
@@ -52,15 +59,17 @@ class FakeFirewall:
         self.global_enabled = False
 
     def set_blocking(self, config, blocking: bool) -> None:
-        """批量切换（命令路径）：转发为组合标记 + 等价单项调用，
-        既有断言（enable/disable 语义）保持兼容。"""
+        """批量切换（P1-4 原子化）：单次原子记录——真实 set_blocking 是
+        单 PS 进程原子操作，旧 fake 拆成 enable→enable_fakeip 顺序调用，
+        enable_fakeip 缺失即抛，掩盖了"部分写入"失败路径（假绿）。
+        语义对齐真实复查：CG-Global 必达目标态；CG-FakeIP 缺失（None）
+        时跳过（幂等）。"""
         self.calls.append("set_blocking_on" if blocking else "set_blocking_off")
-        if blocking:
-            self.enable(config)
-            self.enable_fakeip(config)
-        else:
-            self.disable(config)
-            self.disable_fakeip(config)
+        self.global_enabled = blocking
+        if self.fail_on("set_blocking"):
+            raise FirewallError("set_blocking denied")
+        if self.fakeip_enabled is not None:
+            self.fakeip_enabled = blocking
 
     def block_all(self, config, fakeip_ips=None) -> None:
         """退出路径批量恢复阻断（单 PS 优化路径）：等价 ensure+enable
@@ -93,14 +102,16 @@ class FakeFirewall:
 
     def enable_fakeip(self, config) -> None:
         self.calls.append("enable_fakeip")
+        if self.fail_on("enable_fakeip"):
+            raise FirewallError("enable_fakeip denied")
         if self.fakeip_enabled is None:
-            raise RuntimeError("CG-FakeIP 规则不存在")
+            return  # MISSING 幂等：对齐真实语义（P1-4，不再抛 RuntimeError）
         self.fakeip_enabled = True
 
     def disable_fakeip(self, config) -> None:
         self.calls.append("disable_fakeip")
         if self.fakeip_enabled is None:
-            raise RuntimeError("CG-FakeIP 规则不存在")
+            return  # MISSING 幂等（对齐真实 disable_fakeip）
         self.fakeip_enabled = False
 
     def get_status_fakeip(self, config):
@@ -120,8 +131,6 @@ class FakeFirewall:
     def ensure_enabled_v6(self, config) -> None:
         self.calls.append("ensure_enabled_v6")
 
-    def get_status_v6(self, config) -> bool:
-        return True
 
 
 class FakeNetprobe:
@@ -289,7 +298,8 @@ class TestEventMapping:
             g._tick_count = 4  # 令本轮 slow_due
             g.tick()
         assert g._gstate.state == sm.ALLOWED
-        assert "disable" in fw.calls
+        assert "set_blocking_off" in fw.calls
+        assert fw.global_enabled is False
 
     def test_dirty_exit_blocks_immediately(self, tmp_path):
         np = FakeNetprobe(echo_ip="203.0.113.9")  # 白名单外
@@ -357,7 +367,7 @@ class TestOverride:
         assert g.handle_command("override_30min") is True
         assert g._gstate.on_override is True
         assert g.override_until == 1000 + 30 * 60
-        assert "disable" in fw.calls
+        assert "set_blocking_off" in fw.calls
         # 期间检查失败也不阻断
         np = g.np
         np.mihomo = False
@@ -369,7 +379,7 @@ class TestOverride:
         g.tick()
         assert g._gstate.on_override is False
         assert g._gstate.state == sm.BLOCKED
-        assert "enable" in fw.calls
+        assert "set_blocking_on" in fw.calls
 
     def test_override_audit_log(self, tmp_path):
         g, *_ , _ = make_guardian(tmp_path)
@@ -614,13 +624,14 @@ class TestSelfHeal:
             g._heal_thread.join(timeout=5)
 
     def test_fast_fail_enable_skips_concurrent_heal_overlap(self, tmp_path):
-        """FAST_FAIL → enable 走主循环 _fw_tolerant（持锁）；heal 线程的
-        get_status 与其按次互斥，不会读到半写入状态。这里验证锁在位。"""
+        """FAST_FAIL → set_blocking(True) 走主循环 _fw_tolerant（持锁）；
+        heal 线程的 get_status 与其按次互斥，不会读到半写入状态。
+        P1-4 fake 原子化后，写入即 set_blocking_on（不再有单项 enable）。"""
         np = FakeNetprobe(mihomo=False)
         g, fw, np, *_ , _ = make_guardian(tmp_path, np=np)
         g._gstate = sm.GateState(state=sm.ALLOWED)
         fw.global_enabled = False
-        # 模拟 heal 线程正持锁跑 get_status：主循环 enable 必须等它完成
+        # 模拟 heal 线程正持锁跑 get_status：主循环写入必须等它完成
         fw_slow = threading.Event()
         real_get_status = fw.get_status
 
@@ -638,7 +649,8 @@ class TestSelfHeal:
         g.tick()
         assert g._gstate.state == sm.BLOCKED
         assert fw.global_enabled is True
-        assert fw.calls[calls_index_of(fw, "enable"):].count("enable") >= 1
+        assert fw.calls[calls_index_of(fw, "set_blocking_on"):].count(
+            "set_blocking_on") >= 1
 
     def test_rule_missing_rebuilt_then_restored(self, tmp_path):
         """C3 适配：get_status 返回 MISSING → ensure_exists 重建并按期望恢复。"""
@@ -1166,7 +1178,7 @@ class TestFakeipLifecycle:
         g.tick()
         assert g._gstate.state == sm.BLOCKED
         assert fw.fakeip_enabled is True
-        assert "enable_fakeip" in fw.calls
+        assert "set_blocking_on" in fw.calls  # 原子切换含 FakeIP enable
 
     def test_allowed_state_disables_fakeip(self, tmp_path):
         np = FakeNetprobe(echo_ip="203.0.113.10")  # 白名单内
@@ -1176,8 +1188,8 @@ class TestFakeipLifecycle:
             g._tick_count = 4
             g.tick()
         assert g._gstate.state == sm.ALLOWED
-        assert "disable_fakeip" in fw.calls
         assert fw.fakeip_enabled is False
+        assert "set_blocking_off" in fw.calls  # 原子切换含 FakeIP disable
 
     def test_fakeip_set_change_rebuilds_rule(self, tmp_path):
         """慢路径每轮重解析；集合变化 → create_rule_fakeip 重建。"""
@@ -1475,3 +1487,102 @@ class TestAuditCopyFixes:
         g.tick()
         assert g._last_checks["mihomo进程"] is True
         assert g._last_checks["TUN网卡"] is False
+
+
+# ----------------------------------------------------------------- P1-2 竞态回归
+
+class TestExitHealRace:
+    """P1-2：EXIT 与 rule-heal 竞态——exit 先 _stop.set() 再 block_all（final），
+    heal/_fw_tolerant 见 stop 放弃 disable 方向纠正。"""
+
+    def test_exit_sets_stop_before_block_all(self, tmp_path):
+        """exit 分支顺序契约：block_all 执行时 stop 已置位。"""
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        seen = {}
+
+        def recording_block_all(config, fakeip_ips=None):
+            seen["stop_at_block_all"] = g._stop.is_set()
+            fw.block_all(config, fakeip_ips)
+
+        fw.block_all = recording_block_all
+        assert g.handle_command("exit") is False
+        assert seen["stop_at_block_all"] is True
+
+    def test_fw_tolerant_skips_writes_after_stop(self, tmp_path):
+        """stop 置位后非 final 写入被闸掉；final=True 放行。"""
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        g._stop.set()
+        assert g._fw_tolerant("disable") is False
+        assert "disable" not in fw.calls
+        assert g._fw_tolerant("block_all", final=True) is True
+        assert "block_all" in fw.calls
+
+    def test_heal_aborts_disable_correction_after_stop(self, tmp_path):
+        """heal 飞行中 stop 置位：gstate=ALLOWED（期望 disable）但规则实际
+        Enabled——正常会 disable；退出中必须放弃纠正。"""
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        g._gstate = guardian.sm.GateState(state=guardian.sm.ALLOWED)
+        fw.global_enabled = True   # 实际 Enabled ≠ 期望 disabled → 会纠正
+        g._stop.set()
+        g._self_heal_rules()
+        assert "disable" not in fw.calls
+        assert "disable_fakeip" not in fw.calls
+
+    def test_heal_aborts_fakeip_rebuild_disable_after_stop(self, tmp_path):
+        """MISSING 重建路径：重建成功后退出中，不得按旧期望 disable。"""
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        g._gstate = guardian.sm.GateState(state=guardian.sm.ALLOWED)
+        fw.missing = True
+        fw.global_enabled = True   # ensure_exists 重建后 Enabled
+        g._fakeip_rule_ips = ["198.18.0.1"]
+        fw.fakeip_enabled = None   # CG-FakeIP MISSING → 重建分支
+        g._stop.set()
+        g._self_heal_rules()
+        # CG-Global 重建允许（enable 方向），但 disable 纠正必须被闸掉
+        assert "disable" not in fw.calls
+        assert "disable_fakeip" not in fw.calls
+
+    def test_heal_still_corrects_when_running(self, tmp_path):
+        """正常（非退出）heal 语义不变：期望 disabled、实际 Enabled → 纠正。"""
+        g, fw, *_ , _ = make_guardian(tmp_path)
+        g._gstate = guardian.sm.GateState(state=guardian.sm.ALLOWED)
+        fw.global_enabled = True
+        g._self_heal_rules()
+        assert "disable" in fw.calls
+
+
+# ----------------------------------------------------------------- P1-4 失败路径
+
+class TestFwPersistentFailure:
+    """P1-4：最重 fail-open 链路纳入回归——set_blocking 持续失败时
+    状态机仍迁移 BLOCKED（意图），_fw_tolerant 耗尽返回 False，
+    下轮 heal 仍尝试纠正（意图不被放弃）。"""
+
+    def test_fast_fail_set_blocking_exhaustion(self, tmp_path, caplog):
+        """FAST_FAIL 时 set_blocking 持续抛错：状态迁移照常、写入失败
+        记日志、返回 False——规则未生效的窗口由 heal 兜底，本用例锁
+        「迁移不停、重试有痕」两条不变量。"""
+        np = FakeNetprobe(mihomo=False)
+        fw = FakeFirewall(fail_methods={"set_blocking"})
+        g, fw, np, *_ , _ = make_guardian(tmp_path, np=np, fw=fw)
+        g._gstate = sm.GateState(state=sm.ALLOWED)
+        fw.global_enabled = False
+        import logging as _logging
+        with caplog.at_level(_logging.ERROR, logger="test-guard"):
+            g.tick()
+        assert g._gstate.state == sm.BLOCKED      # 意图迁移不被写入失败阻断
+        assert fw.calls.count("set_blocking_on") == 3  # 重试 3 次
+        assert any("重试 3 次均失败" in r.message for r in caplog.records)
+
+    def test_heal_retries_after_persistent_failure(self, tmp_path):
+        """heal 同因失败 → 下轮 heal 仍尝试（期望未被放弃）。"""
+        fw = FakeFirewall(fail_methods={"enable_fakeip"})
+        g, fw, *_ , _ = make_guardian(tmp_path, fw=fw)
+        g._gstate = sm.GateState(state=sm.BLOCKED)  # 期望 Enabled
+        fw.fakeip_enabled = False                    # 实际 Disabled → 会纠正
+        g._self_heal_rules()
+        n1 = fw.calls.count("enable_fakeip")
+        assert n1 == 3  # 单轮 _fw_tolerant 重试 3 次
+        fw.calls.clear()
+        g._self_heal_rules()
+        assert fw.calls.count("enable_fakeip") == 3  # 下轮照常尝试

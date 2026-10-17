@@ -2,6 +2,8 @@
 """tray.py 状态详情窗口单测：不真弹窗，只断言内容与调用方式。"""
 from __future__ import annotations
 
+import pytest
+
 from core.messages import TECH_SEPARATOR
 from tray import Command, State, StateEvent, Tray
 
@@ -133,3 +135,57 @@ class TestStartupConfirming:
             whitelist_hit=evt.whitelist_hit, checks=evt.checks,
         )
         assert "启动确认中" not in "\n".join(evt2.detail_lines())
+
+
+class TestApplySurvivesBadEvent:
+    """P1-1 回归：_apply 内部抛异常（如曾经的 tooltip NameError）不得杀托盘线程，
+    也不得让 _last_event 停更——事件语义固定为"尽力应用，失败记日志"。"""
+
+    @staticmethod
+    def _icon():
+        """_apply 只有在 _icon 非 None 时才走 tooltip/update_menu（:203）。
+        未 start() 的 Tray._icon 是 None，坏事件根本到不了 tooltip——
+        用最小 fake icon 把 UI 路径接通。"""
+
+        class FakeIcon:
+            icon = None
+            title = ""
+
+            def update_menu(self):
+                pass
+
+        return FakeIcon()
+
+    def test_apply_raises_and_event_loop_survives(self, caplog):
+        """语义对齐设计（05 方案）：_apply 不吞 UI 异常（真实异常应暴露），
+        吞+记日志的是 _event_loop。断言三层：异常传出 _apply、
+        loop 吞掉继续、_last_event 已更新。"""
+        import logging
+        t = Tray()
+        t._icon = self._icon()
+        evt = _event()
+        evt.tooltip = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        with pytest.raises(RuntimeError):
+            t._apply(evt)
+        assert t._last_event is evt  # _last_event 先于 UI 更新（顺序契约）
+        with caplog.at_level(logging.ERROR, logger="claude-guard.tray"):
+            t.events.put(evt)
+            t.events.put(None)
+            t._event_loop()
+        assert any("托盘状态应用失败" in r.message for r in caplog.records)
+
+    def test_event_loop_survives_apply_exception(self, caplog):
+        """_event_loop 吞异常但记日志（不再静默 pass）。"""
+        import logging
+        t = Tray()
+        t._icon = self._icon()
+        bad = _event()
+        bad.tooltip = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        good = _event()
+        with caplog.at_level(logging.ERROR, logger="claude-guard.tray"):
+            t.events.put(bad)
+            t.events.put(good)
+            t.events.put(None)  # 哨兵：处理完即停
+            t._event_loop()
+        assert t._last_event is good  # 坏事件没杀死循环，好事件照常应用
+        assert any("托盘状态应用失败" in r.message for r in caplog.records)

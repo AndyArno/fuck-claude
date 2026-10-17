@@ -182,3 +182,141 @@ class TestFakeipRuleScripts:
         monkeypatch.setattr(fw, "_run_ps", lambda s: calls.append(s) or "OK")
         fw.ensure_exists_fakeip(self._cfg(), ["198.18.0.1"])
         assert not any(c == ("create", ["198.18.0.1"]) for c in calls)
+
+
+class TestSetBlockingOffline:
+    """P1-3：set_blocking 离线断言（喂 PS 输出文本，不发真 PS）。
+
+    动词去掉 -ErrorAction Stop 后，CG-FakeIP 缺失场景必须由复查层
+    正确判读——这组用例锁住按方向收紧的复查语义。"""
+
+    def _cfg(self):
+        return type("C", (), {
+            "rule_name_v4": "CG-Global",
+            "rule_name_fakeip": "CG-FakeIP",
+        })()
+
+    def _run(self, monkeypatch, out):
+        captured = []
+        monkeypatch.setattr(fw, "_run_ps",
+                            lambda s: captured.append(s) or out)
+        return captured
+
+    def test_script_shape(self, monkeypatch):
+        """动词不带 -ErrorAction Stop（P1-3 核心）；数组字面量；无 -Protocol。"""
+        captured = self._run(monkeypatch, "True\nTrue\n")
+        fw.set_blocking(self._cfg(), True)
+        s = captured[0]
+        verb_part = [ln for ln in s.split(";") if "NetFirewallRule" in ln
+                     and "Get-" not in ln][0]
+        assert "-ErrorAction Stop" not in verb_part
+        assert "@('CG-Global','CG-FakeIP')" in s
+        assert "-Protocol" not in s
+
+    def test_disable_fakeip_missing_idempotent(self, monkeypatch):
+        """CG-FakeIP 不存在（单行 False）→ 幂等放行，不抛。"""
+        self._run(monkeypatch, "False\n")
+        fw.set_blocking(self._cfg(), False)  # 不得抛
+
+    def test_disable_both_missing_idempotent(self, monkeypatch):
+        """两条都不存在（空输出）→ 幂等放行。"""
+        self._run(monkeypatch, "")
+        fw.set_blocking(self._cfg(), False)  # 不得抛
+
+    def test_enable_fakeip_missing_ok(self, monkeypatch):
+        """enable 后仅 CG-Global 在（单行 True）→ 达标不抛。"""
+        self._run(monkeypatch, "True\n")
+        fw.set_blocking(self._cfg(), True)  # 不得抛
+
+    def test_enable_global_missing_raises(self, monkeypatch):
+        """enable 后空输出（CG-Global 缺失）→ 抛 FirewallError。"""
+        self._run(monkeypatch, "")
+        try:
+            fw.set_blocking(self._cfg(), True)
+        except fw.FirewallError:
+            pass
+        else:
+            raise AssertionError("enable with no rules must raise")
+
+    def test_enable_partial_failure_raises(self, monkeypatch):
+        """enable 后 CG-FakeIP 仍 Disabled（False,True）→ 抛错。
+
+        注：Get 数组按 DisplayName 顺序返回，CG-Global 在前——
+        states=['False','True'] 即 CG-Global Disabled，必须抛。"""
+        self._run(monkeypatch, "False\nTrue\n")
+        try:
+            fw.set_blocking(self._cfg(), True)
+        except fw.FirewallError:
+            pass
+        else:
+            raise AssertionError("partial enable must raise")
+
+    def test_enable_global_true_fakeip_missing_ok(self, monkeypatch):
+        """states=['True']：CG-Global Enabled、CG-FakeIP 缺失 → 不抛。"""
+        self._run(monkeypatch, "True\n")
+        fw.set_blocking(self._cfg(), True)
+
+    def test_disable_partial_failure_raises(self, monkeypatch):
+        """disable 后仍有 Enabled（True,False）→ 抛错（复查强度不变）。"""
+        self._run(monkeypatch, "True\nFalse\n")
+        try:
+            fw.set_blocking(self._cfg(), False)
+        except fw.FirewallError:
+            pass
+        else:
+            raise AssertionError("partial disable must raise")
+
+
+class TestEnsureEnabledV6Offline:
+    """P1-4：CG-V6 永久 Enabled 硬约束的执行体——MISSING→重建、
+    DISABLED→强制 Enabled、ENABLED→noop 三分支此前零脚本级断言。"""
+
+    def _cfg(self):
+        return type("C", (), {
+            "rule_name_v4": "CG-Global",
+            "rule_name_v6": "CG-V6",
+            "blocked_cidrs_v6": ["2607:6bc0::/48"],
+        })()
+
+    def test_missing_recreates(self, monkeypatch):
+        calls = []
+
+        def fake_run_ps(script):
+            calls.append(script)
+            if "Get-NetFirewallRule" in script:
+                return "MISSING"     # 查询 → 缺失
+            return "OK"              # 重建/enable → 成功
+
+        monkeypatch.setattr(fw, "_run_ps", fake_run_ps)
+        monkeypatch.setattr(fw, "create_rule_v6",
+                            lambda cfg: calls.append("create_rule_v6"))
+        fw.ensure_enabled_v6(self._cfg())
+        assert "create_rule_v6" in calls
+
+    def test_disabled_enables(self, monkeypatch):
+        calls = []
+
+        def fake_run_ps(script):
+            calls.append(script)
+            if "Get-NetFirewallRule" in script:
+                return "DISABLED"    # 查询 → 被禁用
+            return "OK"
+
+        monkeypatch.setattr(fw, "_run_ps", fake_run_ps)
+        fw.ensure_enabled_v6(self._cfg())
+        assert any("Enable-NetFirewallRule" in s and "CG-V6" in s
+                   for s in calls)
+
+    def test_enabled_noop(self, monkeypatch):
+        calls = []
+
+        def fake_run_ps(script):
+            calls.append(script)
+            return "OK"              # 查询输出 OK = 已 Enabled
+
+        monkeypatch.setattr(fw, "_run_ps", fake_run_ps)
+        monkeypatch.setattr(fw, "create_rule_v6",
+                            lambda cfg: calls.append("create_rule_v6"))
+        fw.ensure_enabled_v6(self._cfg())
+        assert "create_rule_v6" not in calls
+        assert not any("Enable-NetFirewallRule" in s for s in calls)

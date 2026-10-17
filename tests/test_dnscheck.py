@@ -157,7 +157,7 @@ class TestGuardianDnsEgress:
         for _ in range(guardian_tests.make_config().fail_unreachable_threshold):
             _slow_tick(g)
         assert g._gstate.state == guardian.sm.BLOCKED
-        assert "enable" in fw.calls
+        assert "set_blocking_on" in fw.calls
 
     def test_dns_whitelist_override(self, tmp_path):
         """dns_whitelist 配置优先于 whitelist。"""
