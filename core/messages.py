@@ -58,6 +58,8 @@ class Status:
     probe_ok: bool | None = None     # 出口探测可达
     exit_ip: str | None = None
     in_whitelist: bool | None = None
+    # 确认窗进度 (已过轮数, 总轮数)，仅 confirming 时有值
+    confirm_progress: tuple[int, int] | None = None
 
 
 def status_line(s: Status) -> str:
@@ -78,7 +80,9 @@ def status_line(s: Status) -> str:
         # 存在，阻断只是挡住使用；未开 Clash → 风险尚未发生。文案不能断言
         # "无泄漏风险"（曾有 DNS 泄漏态显示该字样自相矛盾，用户实测发现）。
         if s.confirming:
-            return "🛡 防火墙正在拦截（确认中，确认通过后自动放行）"
+            prog = (f" {s.confirm_progress[0]}/{s.confirm_progress[1]}"
+                    if s.confirm_progress else "")
+            return f"🛡 防火墙正在拦截（确认中{prog}，确认通过后自动放行）"
         return "🛡 防火墙正在拦截 Claude（已阻断风险连接）"
     return "✅ 防火墙已放行 Claude（出口 IP 干净）"
 

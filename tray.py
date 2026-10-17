@@ -73,6 +73,8 @@ class StateEvent:
     # 临时放行总时长（分钟，来自配置；菜单文案用，曾硬编码 30）
     override_minutes: int = 30
     confirming: bool = False
+    # 确认窗进度 (已过轮数, 总轮数)，仅 confirming 时有值
+    confirm_progress: tuple[int, int] | None = None
 
     def _status(self) -> Status:
         c = self.checks
@@ -84,6 +86,7 @@ class StateEvent:
                                if self.override_min_left is not None
                                else (-1 if self.override_active else None)),
             confirming=self.confirming,
+            confirm_progress=self.confirm_progress,
             proxy_ok=c.get("mihomo进程"),
             tunnel_ok=c.get("TUN网卡"),
             dns_ok=c.get("fake-ip"),

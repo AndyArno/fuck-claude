@@ -378,12 +378,24 @@ class Guardian:
         # echo 与 DNS 探针互相独立（前者量出口 IP、后者量递归出口），
         # 并发执行：wall time = max 而非 sum（坏网络实测串行 ~16s → ~8s）。
         # 两个 wrapper 内部已全吞异常返回结果对象，future.result() 不会再抛。
-        with ThreadPoolExecutor(max_workers=2,
-                                thread_name_prefix="slow-probe") as ex:
-            fut_echo = ex.submit(self._probe_echo)
-            fut_dns = ex.submit(self._probe_dns_egress)
-            echo = fut_echo.result()
-            dns_verdict, dns_probe = fut_dns.result()
+        ex = ThreadPoolExecutor(max_workers=2, thread_name_prefix="slow-probe")
+        fut_echo = ex.submit(self._probe_echo)
+        fut_dns = ex.submit(self._probe_dns_egress)
+        while not (fut_echo.done() and fut_dns.done()):
+            if self._stop.is_set() or self._command_pending():
+                # 命令待处理（退出/暂停/临时放行）：中止本轮探测让主循环
+                # 立刻 drain——退出实测 10s+ 的主因就是 EXIT 排队等慢轮。
+                # 探针只读无副作用，丢弃结果下轮重跑（命令语义全部指向
+                # 阻断或用户显式放行，丢弃一轮不会放大风险窗）；shutdown
+                # 不等待在飞请求（各探针自带超时兜底，线程随后自然结束；
+                # 进程退出走 os._exit 不会被它们挂住）。
+                ex.shutdown(wait=False, cancel_futures=True)
+                self.log.info("命令待处理，中止本轮慢路径探测（下轮重跑）")
+                return None
+            self._sleep(0.05)
+        echo = fut_echo.result()
+        dns_verdict, dns_probe = fut_dns.result()
+        ex.shutdown(wait=True)
         verdict_before = policy.classify(echo.ip if echo.ok else None,
                                          list(self.config.whitelist))
         self._last_echo_ip = echo.ip if echo.ok else self._last_echo_ip
@@ -470,6 +482,16 @@ class Guardian:
         except Exception as exc:
             self.log.warning("echo 探测异常：%s", exc)
             return netprobe.EchoResult(ok=False, ip=None, endpoint=None, error=str(exc))
+
+    def _command_pending(self) -> bool:
+        """托盘命令队列是否有待处理命令（慢路径探测等待期轮询用）。"""
+        tray = self.tray
+        if tray is None:
+            return False
+        try:
+            return not tray.commands.empty()
+        except Exception:  # 防御：托盘对象异常不炸慢路径
+            return False
 
     # ------------------------------------------------------------------ 状态机
 
@@ -1128,6 +1150,19 @@ class Guardian:
             if self._gstate.on_override and self.override_until is not None:
                 override_min = max(
                     0, int((self.override_until - self._clock()) // 60))
+            # 确认中：拦截但检查全过 **且出口判定在白名单**（曾缺白
+            # 名单条件——出口脏时确认窗永不可能通过，却持续显示
+            # "确认通过后自动放行"自相矛盾）。
+            confirming = (self._gstate.state == sm.BLOCKED
+                          and bool(self._last_checks)
+                          and all(v for v in self._last_checks.values())
+                          and self._last_echo_in_whitelist is True)
+            # 确认窗进度：已过 CLEAN 轮数/总轮数（streak 达到 total 即
+            # 迁移 ALLOWED，故 BLOCKED 确认中 streak ∈ [1, total-1]）
+            confirm_progress = None
+            if confirming:
+                total = int(self.config.pass_confirm_count)
+                confirm_progress = (min(self._counter.pass_streak, total), total)
             evt = StateEvent(
                 override_minutes=int(self.config.override_minutes),
                 state=state_map[self._gstate.state],
@@ -1145,13 +1180,8 @@ class Guardian:
                 drift=self._gstate.drift_alarm,
                 override_active=self._gstate.on_override,
                 override_min_left=override_min,
-                # 确认中：拦截但检查全过 **且出口判定在白名单**（曾缺白
-                # 名单条件——出口脏时确认窗永不可能通过，却持续显示
-                # "确认通过后自动放行"自相矛盾）。
-                confirming=(self._gstate.state == sm.BLOCKED
-                            and bool(self._last_checks)
-                            and all(v for v in self._last_checks.values())
-                            and self._last_echo_in_whitelist is True),
+                confirming=confirming,
+                confirm_progress=confirm_progress,
             )
             self.tray.push_event(evt)
         except Exception as exc:

@@ -2069,3 +2069,81 @@ class TestSlowPathProbeConcurrency:
         # 功能不受影响：双 CLEAN → 放行计数 +1（首轮未到阈值无事件）
         assert event is None
         assert g._counter.pass_streak == 1
+
+
+class TestSlowPathCommandAbort:
+    """命令到达时中止慢路径探测：退出/按钮不再排队等慢轮（实测 10s+ 主因）。"""
+
+    def test_pending_exit_aborts_probe_round(self, tmp_path):
+        import socket as s
+        import time as _t
+        from tray import Command
+
+        entered = threading.Event()
+
+        class BlockNp(FakeNetprobe):
+            def probe_echo_endpoints(self, endpoints):
+                entered.set()
+                threading.Event().wait(2)  # 模拟慢端点；中止后无消费者
+                return super().probe_echo_endpoints(endpoints)
+
+        class BlockDns(FakeDns):
+            def check_dns_egress(self, domain, whitelist, allowed_countries=None):
+                entered.set()
+                threading.Event().wait(2)
+                return super().check_dns_egress(domain, whitelist, allowed_countries)
+
+        tray = FakeTray()
+        g, fw, *_ = make_guardian(tmp_path, np=BlockNp(), dns=BlockDns(), tray=tray)
+        real = s.getaddrinfo
+        s.getaddrinfo = lambda h, *a, **k: [(2, 1, 6, "", ("198.18.0.1", 0))]
+        try:
+            # 探测函数先跑起来（第一轮探测无命令、正常完成的语义由其他用例覆盖），
+            # 这里直接入队 EXIT 再进慢路径：轮询第一时间命中中止分支。
+            tray.commands.put(Command.EXIT)
+            local = guardian.netprobe.LocalEnvResult(
+                mihomo_running=True, tun_present=True, error=None)
+            t0 = _t.monotonic()
+            event = g._slow_path(local)
+            elapsed = _t.monotonic() - t0
+        finally:
+            s.getaddrinfo = real
+        assert event is None                 # 本轮结果丢弃
+        assert elapsed < 1.0                 # 不等探针完成（探针自身 2s）
+        assert g._counter.pass_streak == 0   # 计数/状态不被中止轮污染
+
+
+class TestConfirmProgress:
+    """确认窗进度：BLOCKED 确认中推送 (已过轮数, 总轮数) 到托盘。"""
+
+    def test_push_tray_carries_progress(self, tmp_path):
+        tray = FakeTray()
+        g, fw, *_ = make_guardian(tmp_path, tray=tray)
+        g._gstate = sm.GateState(state=sm.BLOCKED)
+        g._last_checks = {"mihomo进程": True, "TUN网卡": True, "fake-ip": True,
+                          "echo出口": True, "DNS出口干净": True}
+        g._last_echo_in_whitelist = True
+        g._counter._pass_streak = 2
+        g._push_tray()
+        evt = tray.events[-1]
+        assert evt.confirming is True
+        assert evt.confirm_progress == (2, 3)
+
+    def test_no_progress_when_not_confirming(self, tmp_path):
+        tray = FakeTray()
+        g, fw, *_ = make_guardian(tmp_path, tray=tray)
+        g._gstate = sm.GateState(state=sm.ALLOWED)
+        g._push_tray()
+        assert tray.events[-1].confirm_progress is None
+
+    def test_streak_clamped_to_total(self, tmp_path):
+        """streak 达到 total 即迁移，理论不超界；越界输入也钳制显示。"""
+        tray = FakeTray()
+        g, fw, *_ = make_guardian(tmp_path, tray=tray)
+        g._gstate = sm.GateState(state=sm.BLOCKED)
+        g._last_checks = {"mihomo进程": True, "TUN网卡": True, "fake-ip": True,
+                          "echo出口": True, "DNS出口干净": True}
+        g._last_echo_in_whitelist = True
+        g._counter._pass_streak = 5
+        g._push_tray()
+        assert tray.events[-1].confirm_progress == (3, 3)

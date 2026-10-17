@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from core.messages import Status, reason_text, toast_block, tooltip
+from core.messages import Status, reason_text, status_line, toast_block, tooltip
 
 
 def _status(**kw) -> Status:
@@ -82,3 +82,13 @@ class TestReasonDnsEgressFalse:
         title, body = toast_block(s)
         assert "环境正常" not in body
         assert "DNS" in body
+
+
+def test_status_line_confirming_with_progress():
+    s = Status(blocking=True, confirming=True, confirm_progress=(2, 3))
+    assert "确认中 2/3" in status_line(s)
+
+
+def test_status_line_confirming_without_progress_unchanged():
+    s = Status(blocking=True, confirming=True)
+    assert status_line(s) == "🛡 防火墙正在拦截（确认中，确认通过后自动放行）"
