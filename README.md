@@ -30,7 +30,7 @@ Windows 门禁工具：mihomo（Clash Verge）未在正确代理链路时自动�
 ClaudeGuard.exe    主程序（单文件，双击弹 UAC 以管理员运行）
 config.json        外置配置（必须与 exe 同目录，用户可编辑）
 install_task.ps1   安装开机自启计划任务（管理员）
-toggle_firewall.ps1  一键切换防火墙拦截/放行（仅守护未运行时，管理员）
+一键切换防火墙状态.cmd  双击切换防火墙拦截/放行（自动弹 UAC 提权；仅守护未运行时）
 ```
 
 
@@ -64,14 +64,11 @@ Remove-NetFirewallRule -DisplayName 'CG-Global','CG-V6' -ErrorAction SilentlyCon
 
 ## 临时切换防火墙（守护未运行时）
 
-管理员 PowerShell 执行：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\toggle_firewall.ps1
-```
+**双击 `一键切换防火墙状态.cmd`**（自动弹 UAC 提权，无需手动开管理员
+PowerShell）。
 
 在「拦截 Claude」与「放行 Claude」之间整体切换三条规则
-（CG-Global / CG-V6 / CG-FakeIP），再运行一次即切回。
+（CG-Global / CG-V6 / CG-FakeIP），再双击一次即切回。
 **仅限 ClaudeGuard 未运行时使用**——守护运行中脚本会拒绝执行
 （其 heal 线程会在 30 秒内把规则改回去，白切）；运行期间请用托盘的
 「暂停守护 / 临时放行」。

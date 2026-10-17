@@ -1,13 +1,27 @@
-﻿# Claude Guard 防火墙一键切换（仅在守护未运行时使用）
-# 用法：管理员 PowerShell 执行：
-#   powershell -ExecutionPolicy Bypass -File toggle_firewall.ps1
-# 效果：在「拦截 Claude」与「放行 Claude」之间整体切换三条规则
-#   （CG-Global / CG-V6 / CG-FakeIP）
-# 再点一次即切换回来；规则本身不删除（彻底清理请用 uninstall.ps1）
-#Requires -RunAsAdministrator
+<# : 2>nul
+@echo off
+rem ============================================================
+rem  Claude Guard - firewall toggle (cmd batch header + PowerShell body)
+rem  Double-click to run; auto-elevates via UAC prompt.
+rem  Only use while ClaudeGuard is NOT running.
+rem ============================================================
+net session >nul 2>&1
+if %errorlevel% neq 0 (
+  echo Requesting administrator privileges . . .
+  powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+  exit /b
+)
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$raw = Get-Content -LiteralPath '%~f0' -Raw -Encoding UTF8; iex $raw"
+echo.
+pause
+exit /b
+#>
 
+# ---------------- PowerShell 正文 ----------------
 $ErrorActionPreference = "Stop"
 $Rules = "CG-Global", "CG-V6", "CG-FakeIP"
+
+Write-Host "=== Claude Guard 防火墙一键切换 ==="
 
 # ① 守护在运行时拒绝执行：heal 线程会在 30 秒内把规则改回去
 $proc = Get-Process -Name "ClaudeGuard" -ErrorAction SilentlyContinue
