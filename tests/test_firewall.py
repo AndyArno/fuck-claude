@@ -78,7 +78,7 @@ class TestTimeoutClassification:
 
 
 class TestCreateRuleNoProtocolRestriction:
-    def test_v4_script_has_no_tcp_protocol(self):
+    def test_v4_script_has_no_tcp_protocol(self, monkeypatch):
         """C4：不得 -Protocol TCP（Any 协议才封得住 UDP/QUIC）。"""
         cfg = type("C", (), {
             "rule_name_v4": "T",
@@ -87,15 +87,9 @@ class TestCreateRuleNoProtocolRestriction:
             "blocked_cidrs_v6": ["2606:4700::/32"],
         })()
         captured = []
-        monkey_target = fw._run_ps
-        def fake_run(script):
-            captured.append(script)
-        fw._run_ps = fake_run
-        try:
-            fw.create_rule(cfg)
-            fw.create_rule_v6(cfg)
-        finally:
-            fw._run_ps = monkey_target
+        monkeypatch.setattr(fw, "_run_ps", lambda s: captured.append(s))
+        fw.create_rule(cfg)
+        fw.create_rule_v6(cfg)
         assert all("-Protocol" not in s for s in captured), captured
 
 

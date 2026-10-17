@@ -199,3 +199,34 @@ def test_rule_name_fakeip_empty_rejected(tmp_path):
     data = dict(VALID, rule_name_fakeip="")
     with pytest.raises(cfg.ConfigError, match="rule_name_fakeip"):
         cfg.load(write_cfg(tmp_path, data))
+
+
+# ---- P3-1：全角字母不是合法 ISO 国家码 -------------------------------------
+
+def test_dns_egress_countries_fullwidth_rejected(tmp_path):
+    """P3-1：全角"ＵＳ" isalpha 为 True 但永不匹配 ASCII 国家码，必须拒绝。"""
+    data = dict(VALID, dns_egress_countries=["ＵＳ"])
+    with pytest.raises(cfg.ConfigError, match="两位国家码"):
+        cfg.load(write_cfg(tmp_path, data))
+
+
+def test_dns_egress_countries_ascii_still_accepted(tmp_path):
+    data = dict(VALID, dns_egress_countries=["US", "JP"])
+    c = cfg.load(write_cfg(tmp_path, data))
+    assert c.dns_egress_countries == ["US", "JP"]
+
+
+# ---- P3-2：blocked_cidrs_v6 非空校验（与 v4 对称）---------------------------
+
+def test_empty_blocked_cidrs_v6_rejected(tmp_path):
+    """P3-2：空 v6 段列表会让 create_rule_v6 生成 @() 行为未定义，必须拒绝。"""
+    data = dict(VALID, blocked_cidrs_v6=[])
+    with pytest.raises(cfg.ConfigError, match="blocked_cidrs_v6"):
+        cfg.load(write_cfg(tmp_path, data))
+
+
+def test_missing_blocked_cidrs_v6_rejected(tmp_path):
+    data = dict(VALID)
+    del data["blocked_cidrs_v6"]
+    with pytest.raises(cfg.ConfigError, match="blocked_cidrs_v6"):
+        cfg.load(write_cfg(tmp_path, data))

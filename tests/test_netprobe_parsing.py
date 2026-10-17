@@ -128,3 +128,51 @@ class TestCheckTunAdapterOffline:
         })
         present, _ = check_tun_adapter(["verge"])
         assert present is True
+
+
+# ---- P3-4：trace 分发剥 query/fragment + lower ------------------------------
+
+def test_probe_trace_endpoint_with_query_uses_trace_parser(monkeypatch):
+    """P3-4：带 query 的 /cdn-cgi/trace URL 不再被当纯文本 IP 解析。"""
+    import winplat.netprobe as np
+
+    class FakeResp:
+        text = "h=www.cloudflare.com\nip=203.0.113.7\n"
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(np.requests, "get", lambda *a, **k: FakeResp())
+    r = np.probe_echo_endpoints(["https://www.cloudflare.com/cdn-cgi/trace?x=1"])
+    assert r.ok and r.ip == "203.0.113.7"
+
+
+def test_probe_trace_endpoint_uppercase_path_uses_trace_parser(monkeypatch):
+    import winplat.netprobe as np
+
+    class FakeResp:
+        text = "ip=198.51.100.5\n"
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(np.requests, "get", lambda *a, **k: FakeResp())
+    r = np.probe_echo_endpoints(["https://www.cloudflare.com/CDN-CGI/Trace/"])
+    assert r.ok and r.ip == "198.51.100.5"
+
+
+def test_probe_text_endpoint_still_uses_text_parser(monkeypatch):
+    import winplat.netprobe as np
+
+    class FakeResp:
+        text = "198.51.100.6\n"
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(np.requests, "get", lambda *a, **k: FakeResp())
+    r = np.probe_echo_endpoints(["https://api.ip.sb/ip"])
+    assert r.ok and r.ip == "198.51.100.6"
+
+
+def test_trace_url_constant_removed():
+    """P3-4：TRACE_URL 死常量已删。"""
+    import winplat.netprobe as np
+    assert not hasattr(np, "TRACE_URL")

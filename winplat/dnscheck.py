@@ -227,6 +227,8 @@ DNS_RECORD_FREE_TYPE = 0  # DnsRecordListFree 的 FreeType（DnsFreeRecordList�
 _TXT_HEADER_SIZE = 32
 _STRINGCOUNT_OFFSET = 0
 _STRINGARRAY_OFFSET = 8
+# _DnsRecordHead.Data 拷贝的字节数上限
+_TXT_DATA_SIZE = 64
 
 
 class _DnsRecordHead(ctypes.Structure):
@@ -294,7 +296,14 @@ def parse_ecs_cidr(records: Iterable[str]) -> str | None:
 
 
 def _read_string_array(data: bytes, count: int) -> list[str]:
-    """从 DNS_TXT_DATAA 原始字节读内联指针数组指向的 NUL 结尾窄字符串。"""
+    """从 DNS_TXT_DATAA 原始字节读内联指针数组指向的 NUL 结尾窄字符串。
+
+    count 由调用方保证不越界：Data 联合只拷贝 64 字节（实际为 wDataLength），
+    每个 PSTR 指针占 8 字节，data 区从偏移 8 开始，故最多可读
+    (64 - 8) // 8 = 7 个指针。TXT 记录字段语义上单 record 的字符串数
+    远小于 7（akahelp 的 ns/ip/ecs 每条 1-3 串），超出视为异常响应
+    截断处理，绝不 unpack_from 越界读（P3-3）。
+    """
     texts: list[str] = []
     for i in range(count):
         (addr,) = struct.unpack_from("<Q", data, _STRINGARRAY_OFFSET + 8 * i)
@@ -337,7 +346,10 @@ def query_txt_windows(hostname: str) -> DnsEgressResult:
             if rec.wType == DNS_TYPE_TXT:
                 data = bytes(rec.Data)
                 (count,) = struct.unpack_from("<I", data, _STRINGCOUNT_OFFSET)
-                if 0 < count < 64:
+                # P3-3：Data 只拷 64 字节，偏移 8 起每指针 8 字节 → 至多 7 个；
+                # 超出的 count 一律按 7 截断，防止 unpack_from 越界 struct.error。
+                count = min(count, (_TXT_DATA_SIZE - _STRINGARRAY_OFFSET) // 8)
+                if 0 < count:
                     texts.extend(_read_string_array(data, count))
             p = rec.pNext
     finally:

@@ -17,8 +17,6 @@ import requests
 # 同时保证正常端点（<1s）不受影响。DIRTY 判定仍基于本轮最新探测结果。
 ECHO_TIMEOUT_SEC = 3
 
-# 主端点：Cloudflare trace 文本
-TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 # 备端点：纯文本 IP
 IPSB_URL = "https://api.ip.sb/ip"
 
@@ -88,9 +86,12 @@ def _looks_like_ip(text: str | None) -> bool:
 def probe_echo_endpoints(endpoints: list[str], timeout: float = ECHO_TIMEOUT_SEC) -> EchoResult:
     """依次探测 echo 端点，主端点失败自动切备。
 
-    - TRACE_URL：解析 trace 文本的 ip= 行
+    - /cdn-cgi/trace 结尾端点：解析 trace 文本的 ip= 行
     - 其他端点（如 api.ip.sb/ip）：按纯文本 IP 处理
     返回第一个成功端点的结构化结果；全部失败返回 ok=False。
+
+    分发前剥 query/fragment 并 lower：`.../cdn-cgi/trace?x=1` 或
+    大小写变体同样走 trace 解析（P3-4）。
     """
     last_error = "no endpoints configured"
     for url in endpoints:
@@ -103,8 +104,8 @@ def probe_echo_endpoints(endpoints: list[str], timeout: float = ECHO_TIMEOUT_SEC
 
         # 按路径特征分发：任何 /cdn-cgi/trace 端点（cloudflare.com、
         # chatgpt.com、api.openai.com 等 CF 代理域）都用 trace 解析。
-        # 曾按 TRACE_URL 精确比对，探针换域后被当纯文本 IP 解析恒失败。
-        if url.rstrip("/").endswith("/cdn-cgi/trace"):
+        path = url.split("://", 1)[-1].split("?", 1)[0].split("#", 1)[0].rstrip("/").lower()
+        if path.endswith("/cdn-cgi/trace"):
             ip = parse_trace_ip(resp.text)
             parser_name = "trace"
         else:

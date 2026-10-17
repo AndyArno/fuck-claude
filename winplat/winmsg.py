@@ -95,8 +95,12 @@ class LiveMessageBox:
         self._locate()
         if self._dlg and self._ctrl:
             user32 = ctypes.windll.user32
-            if text != self._text:
+            # 标题/正文各自判变分别更新（P3-9）：正文不变仅标题变化
+            # （如状态迁移但检查项相同）时标题也要刷新。
+            if title != self._title:
                 user32.SetWindowTextW(self._dlg, title)
+                self._title = title
+            if text != self._text:
                 user32.SendMessageW(self._ctrl, 0x000C, 0, text)  # WM_SETTEXT
                 self._text = text
 

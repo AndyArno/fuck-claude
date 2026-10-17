@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """DNS 出口探针（检查⑤）测试：TXT 解析纯函数 + guardian 三态接入。"""
 import logging
+import ctypes
+import struct
 
 import pytest
 
@@ -466,3 +468,59 @@ class TestCheckFakeipEdges:
 def messages_reason(s):
     from core import messages
     return messages.reason_text(s)
+
+
+# ---- P3-3：TXT 字符串数越界防护（_read_string_array 不抛 struct.error）-------
+
+def _make_txt_record_bytes(count: int) -> bytes:
+    """离线构造 DNS_TXT_DATAA 原始字节：StringCount + 内联指针数组。"""
+    return struct.pack("<I4x", count) + b"\x00" * 56
+
+
+class TestTxtCountGuard:
+    def test_count_8_no_struct_error(self):
+        """P3-3：count=8 超出 64 字节 Data 可容纳的 7 个指针，应截断不越界。"""
+        data = _make_txt_record_bytes(8)
+        texts = dnscheck._read_string_array(data, 7)
+        assert texts == []
+
+    def test_count_63_clamped_no_struct_error(self):
+        data = _make_txt_record_bytes(63)
+        # 计算与生产同口径的上限：偏移 8 起，每指针 8 字节
+        max_count = (64 - dnscheck._STRINGARRAY_OFFSET) // 8
+        assert max_count == 7
+        texts = dnscheck._read_string_array(data, max_count)
+        assert texts == []
+
+    def test_query_txt_windows_clamps_count(self, monkeypatch):
+        """count=8 时 query_txt_windows 走截断分支，返回 no TXT records 而非抛异常。"""
+        rec = dnscheck._DnsRecordHead()
+        rec.wType = dnscheck.DNS_TYPE_TXT
+        rec.Data = (ctypes.c_ubyte * 64)(
+            *[8] + [0] * 63)  # StringCount=8，其余为 0（指针全 NULL）
+
+        class FakeHead:
+            def __init__(self):
+                self.wType = dnscheck.DNS_TYPE_TXT
+                self.Data = rec.Data
+                self.pNext = None
+
+        class FakeDnsapi:
+            def DnsQuery_A(self, *args):
+                return 0
+            def DnsRecordListFree(self, *args):
+                pass
+
+        fake_record = FakeHead()
+        fake_record.wType = dnscheck.DNS_TYPE_TXT
+        monkeypatch.setattr(dnscheck.ctypes, "WinDLL", lambda *a, **k: FakeDnsapi())
+        # 用真实 _DnsRecordHead 实例走 cast 路径
+        holder = dnscheck._DnsRecordHead()
+        holder.wType = dnscheck.DNS_TYPE_TXT
+        holder.Data = (ctypes.c_ubyte * 64)(8, *[0] * 63)
+        ptr = ctypes.cast(ctypes.pointer(holder), ctypes.c_void_p)
+        monkeypatch.setattr(ctypes, "cast",
+                            lambda p, t: type("C", (), {"contents": holder})())
+        result = dnscheck.query_txt_windows("whoami.ds.akahelp.net")
+        assert result.ok is False
+        assert "no TXT records parsed" in (result.error or "")

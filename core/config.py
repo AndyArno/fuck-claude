@@ -146,7 +146,7 @@ def validate_config(data: Any) -> None:
     dec = data.get("dns_egress_countries")
     if dec is not None:
         if (not isinstance(dec, list)
-                or not all(isinstance(x, str) and len(x) == 2 and x.isalpha()
+                or not all(isinstance(x, str) and len(x) == 2 and x.isascii() and x.isalpha()
                            for x in dec)):
             errors.append(f"字段 'dns_egress_countries' 必须是两位国家码列表（当前值: {dec!r}）")
     # 可选 rule_name_fakeip：给了就必须是非空字符串，缺省 "CG-FakeIP"
@@ -164,6 +164,8 @@ def validate_config(data: Any) -> None:
         errors.append("字段 'claude_domains' 不能为空：漂移检测依赖域名列表（D-1）")
     if not data.get("blocked_cidrs_v4"):
         errors.append("字段 'blocked_cidrs_v4' 不能为空：门禁需要至少一个封禁段（B-1）")
+    if not data.get("blocked_cidrs_v6"):
+        errors.append("字段 'blocked_cidrs_v6' 不能为空：v6 门禁需要至少一个封禁段（B-1）")
 
     if errors:
         raise ConfigError("配置校验失败，共 %d 处问题：\n  - %s" % (len(errors), "\n  - ".join(errors)))
