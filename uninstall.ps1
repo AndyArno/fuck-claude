@@ -1,4 +1,4 @@
-# Claude Guard 卸载脚本（需求 P 系 / dev-plan 5.4）
+﻿# Claude Guard 卸载脚本（需求 P 系 / dev-plan 5.4）
 # 用法：管理员 PowerShell 执行：
 #   powershell -ExecutionPolicy Bypass -File uninstall.ps1
 #Requires -RunAsAdministrator
@@ -23,8 +23,9 @@ if ($existing) {
     Write-Host "计划任务 '$TaskName' 不存在（跳过）"
 }
 
-# ③ 删除防火墙规则 CG-Global / CG-V6
-foreach ($rule in "CG-Global", "CG-V6") {
+# ③ 删除防火墙规则 CG-Global / CG-V6 / CG-FakeIP
+#    （CG-FakeIP 为 fake-ip 拦截规则，按需创建，后来新增）
+foreach ($rule in "CG-Global", "CG-V6", "CG-FakeIP") {
     $found = Get-NetFirewallRule -DisplayName $rule -ErrorAction SilentlyContinue
     if ($found) {
         Remove-NetFirewallRule -DisplayName $rule

@@ -30,7 +30,7 @@ Windows 门禁工具：mihomo（Clash Verge）未在正确代理链路时自动�
 ClaudeGuard.exe    主程序（单文件，双击弹 UAC 以管理员运行）
 config.json        外置配置（必须与 exe 同目录，用户可编辑）
 install_task.ps1   安装开机自启计划任务（管理员）
-uninstall.ps1      卸载脚本：删计划任务 + 删防火墙规则（管理员）
+toggle_firewall.ps1  一键切换防火墙拦截/放行（仅守护未运行时，管理员）
 ```
 
 
@@ -62,6 +62,20 @@ Remove-NetFirewallRule -DisplayName 'CG-Global','CG-V6' -ErrorAction SilentlyCon
 > 重新打包（开发者）：`.venv/Scripts/pyinstaller.exe claude-guard.spec --noconfirm`，
 > 产物为 `dist/ClaudeGuard.exe`；`config.json` 不打包进 exe（需求 P-3，保持可编辑）。
 
+## 临时切换防火墙（守护未运行时）
+
+管理员 PowerShell 执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\toggle_firewall.ps1
+```
+
+在「拦截 Claude」与「放行 Claude」之间整体切换三条规则
+（CG-Global / CG-V6 / CG-FakeIP），再运行一次即切回。
+**仅限 ClaudeGuard 未运行时使用**——守护运行中脚本会拒绝执行
+（其 heal 线程会在 30 秒内把规则改回去，白切）；运行期间请用托盘的
+「暂停守护 / 临时放行」。
+
 ## 卸载
 
 管理员 PowerShell 执行：
@@ -71,7 +85,7 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 ```
 
 脚本会：结束 ClaudeGuard 进程 → 删除计划任务 `ClaudeGuard` →
-删除防火墙规则 `CG-Global`、`CG-V6`。
+删除防火墙规则 `CG-Global`、`CG-V6`、`CG-FakeIP`。
 最后**手动删除程序目录**（脚本不自动删，避免误删你编辑过的 config.json）。
 
 ## 故障排查："Claude 连不上"
