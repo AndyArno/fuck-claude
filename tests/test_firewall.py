@@ -198,6 +198,9 @@ class TestSetBlockingOffline:
 
     def _run(self, monkeypatch, out):
         captured = []
+        # 强制走 PS 全量路径：本类断言的是 PS 复查语义；不 stub 时快车道
+        # 会碰真实防火墙（本机有同名规则时 netsh rc=0），非密闭。
+        monkeypatch.setattr(fw, "_netsh_set_enabled", lambda n, e: False)
         monkeypatch.setattr(fw, "_run_ps",
                             lambda s: captured.append(s) or out)
         return captured
@@ -265,6 +268,101 @@ class TestSetBlockingOffline:
             pass
         else:
             raise AssertionError("partial disable must raise")
+
+
+class TestNetshFastLane:
+    """netsh 快车道：规则存在时绕过 PS（~0.5s vs 2.7-3.8s）；
+    任一失败回退 PS 全量路径。离线——monkeypatch 两个底层入口。"""
+
+    def _cfg(self):
+        return type("C", (), {
+            "rule_name_v4": "CG-Global",
+            "rule_name_fakeip": "CG-FakeIP",
+            "blocked_cidrs_v4": ["160.79.104.0/23"],
+        })()
+
+    def _netsh(self, monkeypatch, results):
+        """results: {display_name: bool}；返回调用记录。"""
+        calls = []
+
+        def fake(name, enabled):
+            calls.append((name, enabled))
+            return results.get(name, False)
+
+        monkeypatch.setattr(fw, "_netsh_set_enabled", fake)
+        return calls
+
+    def _ps_must_not_run(self, monkeypatch):
+        monkeypatch.setattr(
+            fw, "_run_ps",
+            lambda s: (_ for _ in ()).throw(
+                AssertionError("fast lane must not invoke PS")))
+
+    # ---- set_blocking ----
+
+    def test_set_blocking_fast_lane_skips_ps(self, monkeypatch):
+        calls = self._netsh(monkeypatch,
+                            {"CG-Global": True, "CG-FakeIP": True})
+        self._ps_must_not_run(monkeypatch)
+        fw.set_blocking(self._cfg(), True)
+        assert calls == [("CG-Global", True), ("CG-FakeIP", True)]
+
+    def test_set_blocking_disable_fast_lane(self, monkeypatch):
+        calls = self._netsh(monkeypatch,
+                            {"CG-Global": True, "CG-FakeIP": True})
+        self._ps_must_not_run(monkeypatch)
+        fw.set_blocking(self._cfg(), False)
+        assert calls == [("CG-Global", False), ("CG-FakeIP", False)]
+
+    def test_set_blocking_fakeip_missing_tolerated(self, monkeypatch):
+        """CG-Global 成功（=权限正常）后 CG-FakeIP rc=1 只可能是缺失：
+        两个方向都可接受，不回退 PS。"""
+        self._netsh(monkeypatch, {"CG-Global": True, "CG-FakeIP": False})
+        self._ps_must_not_run(monkeypatch)
+        fw.set_blocking(self._cfg(), True)   # 不得抛、不得调 PS
+        fw.set_blocking(self._cfg(), False)
+
+    def test_set_blocking_global_fail_falls_back_to_ps(self, monkeypatch):
+        """CG-Global netsh 失败（缺失/权限）→ 回退 PS 全量路径。"""
+        self._netsh(monkeypatch, {"CG-Global": False})
+        captured = []
+        monkeypatch.setattr(fw, "_run_ps",
+                            lambda s: captured.append(s) or "True\nTrue\n")
+        fw.set_blocking(self._cfg(), True)
+        assert captured and "Enable-NetFirewallRule" in captured[0]
+
+    # ---- block_all ----
+
+    def test_block_all_fast_lane_skips_ps(self, monkeypatch):
+        calls = self._netsh(monkeypatch,
+                            {"CG-Global": True, "CG-FakeIP": True})
+        self._ps_must_not_run(monkeypatch)
+        fw.block_all(self._cfg(), ["198.18.0.1"])
+        assert ("CG-FakeIP", True) in calls
+
+    def test_block_all_empty_fakeips_skips_fakeip_netsh(self, monkeypatch):
+        """fakeip_ips 为空：CG-FakeIP 本就可能不存在，netsh 都不发。"""
+        calls = self._netsh(monkeypatch, {"CG-Global": True})
+        self._ps_must_not_run(monkeypatch)
+        fw.block_all(self._cfg(), None)
+        assert calls == [("CG-Global", True)]
+
+    def test_block_all_known_fakeips_missing_falls_back(self, monkeypatch):
+        """fakeip 集合已知但规则缺失 → 回退 PS 重建（保原 block_all 语义）。"""
+        self._netsh(monkeypatch, {"CG-Global": True, "CG-FakeIP": False})
+        captured = []
+        monkeypatch.setattr(fw, "_run_ps",
+                            lambda s: captured.append(s) or "True\nTrue\n")
+        fw.block_all(self._cfg(), ["198.18.0.1"])
+        assert captured and "New-NetFirewallRule" in captured[0]
+
+    def test_block_all_global_fail_falls_back(self, monkeypatch):
+        self._netsh(monkeypatch, {"CG-Global": False})
+        captured = []
+        monkeypatch.setattr(fw, "_run_ps",
+                            lambda s: captured.append(s) or "True\n")
+        fw.block_all(self._cfg(), None)
+        assert captured
 
 
 class TestEnsureEnabledV6Offline:

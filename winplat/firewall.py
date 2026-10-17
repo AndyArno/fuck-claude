@@ -129,6 +129,38 @@ def _is_access_denied(output: str) -> bool:
     )
 
 
+_NETSH_TIMEOUT = 5  # netsh 本地规则库操作，实测 ~235ms；5s 足够兜底
+
+
+def _netsh_set_enabled(display_name: str, enabled: bool) -> bool:
+    """netsh 快车道：切换单条**已存在**规则的 Enabled，返回成功与否。
+
+    动机：PowerShell 每次进程付 ~2.5s NetSecurity 加载税（按钮/退出/风险
+    阻断的同步路径全被它拖慢，实测 set_blocking 2.7-3.8s、block_all 6.2s
+    ——[耗时] 日志）；netsh 是原生进程无此税，实测（PS 创建的规则、中文
+    Win11）enable/disable 各 ~235ms rc=0 且 NetSecurity 侧读回状态一致，
+    规则缺失 rc=1。
+
+    只看退出码、不解析输出（中文系统输出本地化，解析脆）。rc!=0 的任何
+    情况（规则缺失/权限不足/工具异常）都返回 False 由调用方回退 PS 全量
+    路径——权限不足会在 PS 路径被 _run_ps 重新分类为规范的
+    FirewallPermissionError，错误分类不被快车道破坏。
+    """
+    cmd = ["netsh", "advfirewall", "firewall", "set", "rule",
+           f'name="{display_name}"', "new",
+           f"enable={'yes' if enabled else 'no'}"]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=_NETSH_TIMEOUT,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return proc.returncode == 0
+
+
 # ---------------------------------------------------------------- CG-Global
 
 def create_rule(config: Config) -> None:
@@ -197,6 +229,15 @@ def set_blocking(config: Config, blocking: bool) -> None:
     动词对不存在规则 exit 0 假成功——不能只看 _run_ps 不抛，必须逐值
     比对 states（AGENTS.md 已录坑）。
     """
+    # ---- netsh 快车道（实测 ~235ms/次，两条 ~0.5s vs PS 单进程 2.7-3.8s）。
+    # CG-Global 成功即证明权限与工具链正常；此时 CG-FakeIP rc=1 只可能是
+    # 规则缺失（同进程权限），缺失在两个方向都可接受（与下方 PS 复查语义
+    # 一致：disable 缺失=幂等放行；enable 缺失由 heal 线程重建兜底）。
+    # CG-Global 失败（规则缺失/权限不足）→ 回退 PS 全量路径，行为不劣于
+    # 原实现（缺失重建、逐值复查、权限错误分类都在既有路径承担）。
+    if _netsh_set_enabled(config.rule_name_v4, blocking):
+        _netsh_set_enabled(config.rule_name_fakeip, blocking)
+        return
     n1 = _ps_quote(config.rule_name_v4)
     n2 = _ps_quote(config.rule_name_fakeip)
     verb = "Enable" if blocking else "Disable"
@@ -241,6 +282,14 @@ def block_all(config: Config, fakeip_ips: list[str] | None = None) -> None:
     fakeip_ips=None/空 → CG-FakeIP 不存在则跳过（无 fake-ip 集合时
     重建无意义，与原路径 if self._fakeip_rule_ips 一致）。
     """
+    # ---- netsh 快车道：两条规则都已存在时 ~0.5s 完成退出（实测 PS 全量
+    # 路径 6.2s——[耗时] 日志）。CG-Global rc=0 → 权限正常。CG-FakeIP：
+    # fakeip_ips 为空时 rc=1 只可能是缺失（本就可能不存在），直接完成；
+    # fakeip_ips 已知但规则缺失时回退 PS 重建——与原 block_all"有集合
+    # 必重建"的语义保持一致。
+    if _netsh_set_enabled(config.rule_name_v4, True):
+        if not fakeip_ips or _netsh_set_enabled(config.rule_name_fakeip, True):
+            return
     n1 = _ps_quote(config.rule_name_v4)
     n2 = _ps_quote(config.rule_name_fakeip)
     remote1 = _ps_array(list(config.blocked_cidrs_v4))

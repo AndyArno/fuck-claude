@@ -92,7 +92,7 @@ slow 每 5 轮查一次。单线程无竞态。
 
 | 模块 | 职责 | 实现 |
 |---|---|---|
-| `firewall.py` | **三条规则**：CG-Global（IPv4 门控，Enable/Disable 随状态机）+ CG-V6（IPv6 永久 Enabled，启动时 ensure_exists，此后每轮只校验不切换——门禁无权放行）+ CG-FakeIP（门控，与 CG-Global 同步 Enable/Disable；RemoteAddress = claude_domains 当前解析到的 fake-ip 集合，慢路径每轮重采集、变化即重建）；规则存在性校验、创建、状态读取 | `powershell -NoProfile -Command "..."` 子进程封装 NetSecurity cmdlet。**每次主循环校验规则实际状态**（防第三方安全软件重置） |
+| `firewall.py` | **三条规则**：CG-Global（IPv4 门控，Enable/Disable 随状态机）+ CG-V6（IPv6 永久 Enabled，启动时 ensure_exists，此后每轮只校验不切换——门禁无权放行）+ CG-FakeIP（门控，与 CG-Global 同步 Enable/Disable；RemoteAddress = claude_domains 当前解析到的 fake-ip 集合，慢路径每轮重采集、变化即重建）；规则存在性校验、创建、状态读取 | `powershell -NoProfile -Command "..."` 子进程封装 NetSecurity cmdlet；**同步切换路径（set_blocking/block_all）先走 netsh 快车道**（~235ms/次，规避 PS ~2.5s/进程加载税），CG-Global 操作失败才回退 PS 全量（缺失重建+复查+权限分类）。规则状态校验由独立 heal 线程承担 |
 | `netprobe.py` | echo 探测（主备双端点）、mihomo 进程检测、TUN 网卡检测 | `requests`(echo)、`psutil`(进程/网卡) |
 | `dnscheck.py` | fake-ip 生效检测、DoH 解析 | fake-ip：`socket.getaddrinfo` 检查返回 198.18.x.x；DoH：`https://1.1.1.1/dns-query?name=X&type=A`（json） |
 | `ripecheck.py` | RIPE announced-prefixes 查询 | `https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS399358` |
@@ -236,7 +236,7 @@ Drift 线程: DoH 解析 claude.ai = 203.0.113.5 (不在 160.79.104.0/23)
 | 探测路径分流被用户改坏 | 用户操作 | 启动/放行态自动校验 + 黄灯提示 |
 | WFP 规则被第三方安全软件重置 | ≤30s（自愈周期） | 自愈每 30s 校验 + 状态迁移后必查 + 失败下一轮立即重试 |
 | B-7 时序残余：含自愈 PS 调用的 tick | 最坏 ~4–5s（29/30 tick 满足 2s） | 自愈移出快路径 + FAST_FAIL 当轮跳过；如需绝对 2s 改 WFP API 直调 |
-| 规则切换延迟（PS 子进程） | ~1.6–3s/次 | B-4 已修订；如需毫秒级改 WFP API/Go 服务 |
+| 规则切换延迟（PS 子进程） | 同步路径 netsh 快车道 ~0.4s；回退路径 ~1.6–3s/次 | netsh 覆盖 enable/disable 热路径；如需毫秒级改 WFP API/Go 服务 |
 | override 窗口内强杀进程 | 最长 30min 放行态裸奔 | 审计日志 + 用户自担；看门狗任务为可选后续 |
 | CG-V6 被第三方禁用的暴露窗口 | ~30s | 暂停期间每 tick 校验；正常态每 30s ensure_enabled_v6 |
 | 旧版 TCP-only 规则升级不自动迁移 | 升级部署 | 首次部署无存量；升级时手动删两条 CG-* 规则或改 config 触发重建（发布说明已记） |

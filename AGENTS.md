@@ -132,6 +132,7 @@ main.py / scripts/run_guardian.py   打包入口 / 开发态入口（共用 main
 | ⑤段白名单与④共用 | Proxies 组换段（机场节点段漂移）后⑤恒 DIRTY 永久阻断 | ⑤改归属国判定（dns_egress_countries=["US"]，geo /24 缓存 1h），段白名单仅作精确逃生口 |
 | PS 复查按"期望行数"严格比对 | 规则存在性与 ips 参数不对齐时恒误判失败（block_all 首版：CG-FakeIP 存在→2 行 vs 期望 1 行→重试 3 次白拖 8s） | 复查语义=查到的必须全 Enabled 且≥1 条，Enable 带 -ErrorAction Stop |
 | 退出命令 4 次串行 PS 调用 | 托盘退出 15.6s（每次 ~2.5s NetSecurity 加载税） | firewall.block_all() 单进程"重建+启用+复查"，实测 3.6s |
+| 同步路径全靠 PS（按钮/退出/风险阻断 2.7-3.8s，退出实测 6.2s） | NetSecurity 每次进程 ~2.5s 加载税无法避免 | `set_blocking`/`block_all` 先走 netsh 快车道（实测 ~235ms/次、缺失 rc=1），CG-Global 失败才回退 PS 全量；CG-FakeIP rc=1 视为缺失（同进程权限已证），两方向均可容忍 |
 
 ## 文档地图
 
