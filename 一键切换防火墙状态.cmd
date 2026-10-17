@@ -21,11 +21,12 @@ exit /b
 $ErrorActionPreference = "Stop"
 $Rules = "CG-Global", "CG-V6", "CG-FakeIP"
 
-Write-Host "=== Claude Guard 防火墙一键切换 ==="
+Write-Host "=== Claude Guard 防火墙切换 ==="
 
 # ① 守护在运行时拒绝执行：heal 线程会在 30 秒内把规则改回去
 $proc = Get-Process -Name "ClaudeGuard" -ErrorAction SilentlyContinue
 if ($proc) {
+    Write-Host ""
     Write-Host "× ClaudeGuard 正在运行（PID $($proc[0].Id)）。"
     Write-Host "  请先通过托盘菜单退出守护，再运行本脚本；"
     Write-Host "  守护运行期间请直接用托盘的「暂停守护 / 临时放行」。"
@@ -39,20 +40,40 @@ foreach ($r in $Rules) {
     if ($f) { $existing += $r }
 }
 if ($existing.Count -eq 0) {
+    Write-Host ""
     Write-Host "× 未找到任何 CG-* 防火墙规则（可能从未安装或已卸载）。"
     Write-Host "  如需清理环境，请运行 uninstall.ps1；如需启用拦截，请启动 ClaudeGuard。"
     exit 2
 }
 
-# ③ 判定当前状态：任一规则启用 = 当前拦截中
+# ③ 显示当前状态（任一规则启用 = 拦截中）
 $blocking = $false
 foreach ($r in $existing) {
     $now = Get-NetFirewallRule -DisplayName $r -ErrorAction SilentlyContinue
     if ($now -and "$($now.Enabled)" -eq "True") { $blocking = $true }
 }
+Write-Host ""
+if ($blocking) {
+    Write-Host "当前状态：拦截 Claude（规则已启用）"
+} else {
+    Write-Host "当前状态：放行 Claude（规则已停用）"
+}
+Write-Host ""
+Write-Host "请选择操作："
+Write-Host "  1. 开启拦截"
+Write-Host "  2. 关闭拦截（放行）"
+Write-Host ""
+$choice = Read-Host "输入 1 或 2 后回车（直接回车退出）"
+if ($choice -eq "1") {
+    $desired = $true
+} elseif ($choice -eq "2") {
+    $desired = $false
+} else {
+    Write-Host "未选择，已退出（未做任何更改）。"
+    exit 0
+}
 
-# ④ 整体翻转 + 逐条复查（Enable/Disable 的 -PassThru 返回切换前快照，不可信）
-$desired = -not $blocking
+# ④ 应用到全部规则 + 逐条复查（Enable/Disable 的 -PassThru 返回切换前快照，不可信）
 $failed = @()
 foreach ($r in $existing) {
     if ($desired) {
@@ -74,8 +95,8 @@ if ($failed.Count -gt 0) {
 }
 
 if ($desired) {
-    Write-Host "√ 已切换：拦截 Claude（$($existing -join ' / ') 全部启用）"
+    Write-Host "√ 已开启拦截（$($existing -join ' / ') 全部启用）"
 } else {
-    Write-Host "√ 已切换：放行 Claude（$($existing -join ' / ') 全部停用）"
+    Write-Host "√ 已关闭拦截（$($existing -join ' / ') 全部停用）"
     Write-Host "  注意：此时 Claude 流量不再受 Claude Guard 保护。"
 }
